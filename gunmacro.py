@@ -2,6 +2,7 @@ import os
 import sys
 import ctypes
 import json
+import random
 import re
 import subprocess
 import threading
@@ -13,19 +14,19 @@ APP_NAME = "Gun macro"
 IS_WIN = sys.platform == "win32"
 
 # ---------- Paths ----------
-# Uses whoever is logged in: C:\Users\<their name>\Downloads\Gun_Macro
-APP_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "Gun_Macro")
+# Everything lives in %LOCALAPPDATA%\GunMacro so it works on any PC:
+#   app\   the exe + support files (managed by Loader.exe, replaced on updates)
+#   data\  your configs and last session (never touched by updates)
+ROOT_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GunMacro")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_CANDIDATES = [
-    os.path.join(APP_DIR, "Icon.png"),
+    os.path.join(getattr(sys, "_MEIPASS", SCRIPT_DIR), "Icon.png"),   # bundled inside the exe
     os.path.join(SCRIPT_DIR, "Icon.png"),
+    os.path.join(ROOT_DIR, "app", "Icon.png"),
 ]
-
-# Where configs and the last session are stored
-EXE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else SCRIPT_DIR
-BASE_DIR = APP_DIR if os.path.isdir(APP_DIR) else EXE_DIR
-CONFIG_DIR = os.path.join(BASE_DIR, "configs")
-SESSION_FILE = os.path.join(BASE_DIR, "last_session.json")
+DATA_DIR = os.path.join(ROOT_DIR, "data")
+CONFIG_DIR = os.path.join(DATA_DIR, "configs")
+SESSION_FILE = os.path.join(DATA_DIR, "last_session.json")
 
 # ---------- Theme ----------
 BG = "#141414"
@@ -73,7 +74,7 @@ ERROR_COLOR = "#e5737a"
 # ---------- Sidebar ----------
 SIDEBAR = "#0f0f0f"
 HILITE = "#262626"
-TABS = ["Gun Macro", "Config"]
+TABS = ["Gun Macro", "Extras", "Config"]
 SB_W = 190           # sidebar width
 TAB_H = 44
 TAB_GAP = 8
@@ -103,6 +104,10 @@ RELOAD_VK = 0x52         # the R key
 RELOAD_TAPS = 2          # R presses after each number
 RELOAD_DELAY = 0.012     # pause between reload key presses (seconds)
 RELOAD_FRACTION = 0.35   # reload phase = last 35% of the run (at least one full pass)
+
+JITTER = 0.35            # random jitter: each delay varies by +/- 35%
+MID_RELOAD_DELAY = 0.08  # mid reload: one R tap every 80ms (~12/sec)
+HOLD_MAX = 3600          # hold mode: safety cap on one run (seconds)
 
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
@@ -164,7 +169,7 @@ class MacroRunner:
         self.running = False
         self._stop = threading.Event()
 
-    def start(self, vks, seconds, auto_reload=False):
+    def start(self, vks, seconds, auto_reload=False, jitter=False, mid_reload=False):
         if self.running or not vks:
             return
         self.running = True
@@ -177,12 +182,18 @@ class MacroRunner:
             one_pass = len(vks) * (1 + RELOAD_TAPS) * (KEY_HOLD + RELOAD_DELAY)
             window = min(seconds, max(RELOAD_FRACTION * seconds, one_pass * 1.2))
             reload_at = end - window
+        self._vks = vks
+        self._end = end
+        self._reload_at = reload_at
 
         def alive():
-            return time.perf_counter() < end and not self._stop.is_set()
+            return time.perf_counter() < self._end and not self._stop.is_set()
 
         def reloading():
-            return reload_at is not None and time.perf_counter() >= reload_at
+            return self._reload_at is not None and time.perf_counter() >= self._reload_at
+
+        def pause(base):
+            time.sleep(base * random.uniform(1 - JITTER, 1 + JITTER) if jitter else base)
 
         def typer():
             i = 0
@@ -193,16 +204,16 @@ class MacroRunner:
                         if not alive():
                             break
                         key_tap(vk)
-                        time.sleep(RELOAD_DELAY)
+                        pause(RELOAD_DELAY)
                         for _ in range(RELOAD_TAPS):
                             if not alive():
                                 break
                             key_tap(RELOAD_VK)
-                            time.sleep(RELOAD_DELAY)
+                            pause(RELOAD_DELAY)
                     continue
                 key_tap(vks[i % len(vks)])
                 i += 1
-                time.sleep(TYPE_DELAY)
+                pause(TYPE_DELAY)
 
         def clicker():
             while alive():
@@ -210,11 +221,22 @@ class MacroRunner:
                     time.sleep(0.005)
                     continue
                 mouse_click()
-                time.sleep(CLICK_DELAY)
+                pause(CLICK_DELAY)
+
+        def reloader():
+            # mid reload runs on its own thread so the number/click speed is untouched
+            while alive():
+                if reloading():              # the release pass handles R itself
+                    time.sleep(0.005)
+                    continue
+                key_tap(RELOAD_VK)
+                pause(MID_RELOAD_DELAY)
 
         def run():
             threads = [threading.Thread(target=typer, daemon=True),
                        threading.Thread(target=clicker, daemon=True)]
+            if mid_reload:
+                threads.append(threading.Thread(target=reloader, daemon=True))
             for t in threads:
                 t.start()
             for t in threads:
@@ -225,6 +247,18 @@ class MacroRunner:
 
     def stop(self):
         self._stop.set()
+
+    def release(self, auto_reload):
+        """Hold mode: key let go. With auto reload, finish with one reload pass."""
+        if not self.running:
+            return
+        if not auto_reload:
+            self.stop()
+            return
+        now = time.perf_counter()
+        one_pass = len(self._vks) * (1 + RELOAD_TAPS) * (KEY_HOLD + RELOAD_DELAY)
+        self._reload_at = now                  # clicking stops, numbers + R start
+        self._end = now + one_pass * 1.2       # ends after one full pass
 
 
 MODIFIER_KEYSYMS = {
@@ -550,6 +584,7 @@ class App(tk.Tk):
         self._build_keybind_row()
         self._build_time_row()
         self._build_reload_row()
+        self._build_extras()
         self._build_config_view()
 
         self.active_tab = 0
@@ -599,12 +634,20 @@ class App(tk.Tk):
             "mods": list(self.keybind_mods),
             "run_time": self.run_time,
             "auto_reload": self.auto_reload,
+            "hold_mode": self.hold_mode,
+            "mid_reload": self.mid_reload,
+            "roblox_only": self.roblox_only,
+            "jitter": self.jitter,
+            "panic": self.panic,
+            "panic_vk": self.panic_vk,
+            "panic_mods": list(self.panic_mods),
         }
 
     def _apply_snapshot(self, d):
         if not isinstance(d, dict):
             return
         self._capturing = False
+        self._panic_capturing = False
         self._time_active = False
         self._num_active = None
 
@@ -638,6 +681,25 @@ class App(tk.Tk):
         ar = d.get("auto_reload")
         if isinstance(ar, bool):
             self._set_reload(ar, animate=False)
+
+        for key in ("hold_mode", "mid_reload", "roblox_only", "jitter"):
+            v = d.get(key)
+            if isinstance(v, bool):
+                self._set_toggle(key, v, animate=False)
+        if not self.hold_mode and self.mid_reload:
+            self._set_toggle("mid_reload", False, animate=False)
+
+        pk = d.get("panic")
+        if isinstance(pk, str) and pk:
+            self.panic = pk
+            pvk = d.get("panic_vk")
+            self.panic_vk = pvk if isinstance(pvk, int) and not isinstance(pvk, bool) else None
+            pm = d.get("panic_mods")
+            if isinstance(pm, list) and len(pm) == 3:
+                self.panic_mods = tuple(bool(m) for m in pm)
+            else:
+                self.panic_mods = (False, False, False)
+        self._draw_panic()
 
         self._draw_mode_card()
         self._draw_keybox(self.keybind)
@@ -842,6 +904,187 @@ class App(tk.Tk):
                 self._reload_job = None
 
         step()
+
+    # ---------- Extras tab ----------
+    def _build_extras(self):
+        self.extras_view = tk.Frame(self.content, bg=BG)   # packed only on the Extras tab
+        self.hold_mode = False
+        self.mid_reload = False
+        self.roblox_only = False
+        self.jitter = False
+        self.panic = "None"
+        self.panic_vk = None
+        self.panic_mods = (False, False, False)
+        self._panic_capturing = False
+        self._panic_hover = False
+        self._panic_font = tkfont.Font(family="Segoe UI Semibold", size=10)
+        self._toggles = {}
+
+        tk.Frame(self.extras_view, bg=BG, height=14).pack()
+        self._make_toggle("hold_mode", "Hold Mode",
+                          "Runs while the key is held; on release it reloads if Auto Reload is on")
+        self._make_toggle("mid_reload", "Auto Mid Reload",
+                          "Spams R while it shoots. Needs Hold Mode on")
+        self._make_toggle("roblox_only", "Roblox Only",
+                          "Only fires when the Roblox window is in front")
+        self._make_toggle("jitter", "Random Jitter",
+                          "Randomizes the delays a little on every press")
+        self._build_panic_row()
+
+    def _make_toggle(self, key, title, desc):
+        row = tk.Canvas(self.extras_view, height=RELOAD_H, bg=BG, highlightthickness=0)
+        row.pack(side="top", fill="x", padx=32, pady=(0, 10))
+        row.create_text(22, RELOAD_H / 2 - 10, text=title, anchor="w", fill=TEXT,
+                        font=("Segoe UI Semibold", 12))
+        row.create_text(22, RELOAD_H / 2 + 12, text=desc, anchor="w", fill=SUBTEXT,
+                        font=("Segoe UI", 9))
+        sw = tk.Canvas(row, width=46, height=24, bg=CARD, highlightthickness=0,
+                       cursor="hand2")
+        win = row.create_window(0, RELOAD_H / 2, window=sw, anchor="e")
+
+        def layout(e):
+            row.delete("card")
+            rounded_rect(row, 1, 1, e.width - 1, RELOAD_H - 1, CARD_RADIUS,
+                         fill=CARD, outline=CARD, tags="card")
+            row.tag_lower("card")
+            row.coords(win, e.width - 20, RELOAD_H / 2)
+
+        row.bind("<Configure>", layout)
+        sw.bind("<Button-1>", lambda e: self._on_toggle_click(key))
+        self._toggles[key] = {"p": 0.0, "job": None, "sw": sw}
+        self._draw_toggle(key)
+
+    def _on_toggle_click(self, key):
+        if key == "mid_reload" and not self.hold_mode:
+            self._flash("Turn on Hold Mode first", error=True)
+            return
+        self._set_toggle(key, not getattr(self, key))
+        if key == "hold_mode" and not self.hold_mode and self.mid_reload:
+            self._set_toggle("mid_reload", False)     # only works with hold mode
+
+    def _draw_toggle(self, key):
+        st = self._toggles[key]
+        p, c = st["p"], st["sw"]
+        c.delete("all")
+        track = mix(KEYBOX, BTN, p)
+        rounded_rect(c, 1, 1, 45, 23, 11, fill=track, outline=track)
+        x = 12 + 22 * p
+        knob = mix("#bdbdbd", "#111111", p)
+        c.create_oval(x - 8, 4, x + 8, 20, fill=knob, outline=knob)
+
+    def _set_toggle(self, key, value, animate=True):
+        setattr(self, key, bool(value))
+        st = self._toggles[key]
+        if st["job"]:
+            self.after_cancel(st["job"])
+            st["job"] = None
+        target = 1.0 if value else 0.0
+        if not animate:
+            st["p"] = target
+            self._draw_toggle(key)
+            return
+        start = st["p"]
+        steps = 10
+
+        def step(i=0):
+            st["p"] = start + (target - start) * ease_in_out(i / steps)
+            self._draw_toggle(key)
+            if i < steps:
+                st["job"] = self.after(12, lambda: step(i + 1))
+            else:
+                st["job"] = None
+
+        step()
+
+    def _build_panic_row(self):
+        row = tk.Canvas(self.extras_view, height=RELOAD_H, bg=BG, highlightthickness=0)
+        row.pack(side="top", fill="x", padx=32, pady=(0, 10))
+        row.create_text(22, RELOAD_H / 2 - 10, text="Panic Key", anchor="w", fill=TEXT,
+                        font=("Segoe UI Semibold", 12))
+        row.create_text(22, RELOAD_H / 2 + 12, anchor="w", fill=SUBTEXT,
+                        text="Instantly kills a run. Esc while setting it clears it",
+                        font=("Segoe UI", 9))
+        self.panic_box = tk.Canvas(row, width=KEYBOX_MIN, height=KEYBOX_MIN, bg=CARD,
+                                   highlightthickness=0, cursor="hand2")
+        win = row.create_window(0, RELOAD_H / 2, window=self.panic_box, anchor="e")
+
+        def layout(e):
+            row.delete("card")
+            rounded_rect(row, 1, 1, e.width - 1, RELOAD_H - 1, CARD_RADIUS,
+                         fill=CARD, outline=CARD, tags="card")
+            row.tag_lower("card")
+            row.coords(win, e.width - 20, RELOAD_H / 2)
+
+        row.bind("<Configure>", layout)
+        self.panic_box.bind("<Button-1>", self._on_panic_click)
+        self.panic_box.bind("<Enter>", lambda e: self._set_panic_hover(True))
+        self.panic_box.bind("<Leave>", lambda e: self._set_panic_hover(False))
+        self.bind("<KeyPress>", self._on_panic_key, add="+")
+        self._draw_panic()
+
+    def _set_panic_hover(self, state):
+        self._panic_hover = state
+        self._draw_panic()
+
+    def _draw_panic(self, text=None):
+        if text is None:
+            text = self.panic
+        w = max(KEYBOX_MIN, self._panic_font.measure(text) + KEYBOX_PAD)
+        if self._panic_capturing:
+            color = KEYBOX_ACTIVE
+        elif self._panic_hover:
+            color = KEYBOX_HOVER
+        else:
+            color = KEYBOX
+        self.panic_box.config(width=w, height=KEYBOX_MIN)
+        self.panic_box.delete("all")
+        rounded_rect(self.panic_box, 1, 1, w - 1, KEYBOX_MIN - 1, 7,
+                     fill=color, outline=color)
+        self.panic_box.create_text(w / 2, KEYBOX_MIN / 2, text=text, fill=TEXT,
+                                   font=self._panic_font)
+
+    def _on_panic_click(self, _e):
+        if self._panic_capturing:            # click again = cancel
+            self._panic_capturing = False
+            self._draw_panic()
+            return
+        self._panic_capturing = True
+        self._draw_panic("...")
+        self.focus_force()
+
+    def _on_panic_key(self, e):
+        if not self._panic_capturing:
+            return
+        if e.keysym in MODIFIER_KEYSYMS:
+            return "break"
+        if e.keysym == "Escape":             # clear the panic key
+            self.panic, self.panic_vk = "None", None
+            self.panic_mods = (False, False, False)
+            self._panic_capturing = False
+            self._draw_panic()
+            return "break"
+        mods = (bool(e.state & CTRL_MASK), bool(e.state & ALT_MASK),
+                bool(e.state & SHIFT_MASK))
+        vk = e.keycode if IS_WIN else None
+        if vk is not None and vk == self.keybind_vk and mods == self.keybind_mods:
+            self._flash("Panic key can't be the same as the macro key", error=True)
+            self._panic_capturing = False
+            self._draw_panic()
+            return "break"
+        parts = []
+        if mods[0]:
+            parts.append("Ctrl")
+        if mods[1]:
+            parts.append("Alt")
+        if mods[2]:
+            parts.append("Shift")
+        parts.append(key_name(e.keysym, e.keycode))
+        self.panic = " + ".join(parts)
+        self.panic_vk = vk
+        self.panic_mods = mods
+        self._panic_capturing = False
+        self._draw_panic()
+        return "break"
 
     # ---------- Config tab ----------
     def _build_config_view(self):
@@ -1068,8 +1311,23 @@ class App(tk.Tk):
 
     def _poll_hotkey(self):
         was_down = False
+        panic_was = False
         while not self._poll_stop:
             time.sleep(0.005)
+
+            # panic key: kills a run instantly
+            pvk = self.panic_vk
+            pdown = False
+            if pvk is not None:
+                pc, pa, ps = self.panic_mods
+                pdown = (key_is_down(pvk)
+                         and key_is_down(0x11) == pc
+                         and key_is_down(0x12) == pa
+                         and key_is_down(0x10) == ps)
+                if pdown and not panic_was:
+                    self.runner.stop()
+            panic_was = pdown
+
             vk = self.keybind_vk
             if vk is None:
                 was_down = False
@@ -1079,22 +1337,36 @@ class App(tk.Tk):
                     and key_is_down(0x11) == ctrl
                     and key_is_down(0x12) == alt
                     and key_is_down(0x10) == shift)
-            if down and not was_down:
+            if down and not was_down and not pdown:
                 self._try_trigger()
+            elif was_down and not down and self.hold_mode:
+                self.runner.release(self.auto_reload)   # released: reload pass if on, else stop
             was_down = down
 
+    def _fg_is_roblox(self, hwnd):
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+        return buf.value.strip().lower() == "roblox"
+
     def _try_trigger(self):
-        if self._capturing or self._num_active is not None or self._time_active:
+        if (self._capturing or self._panic_capturing
+                or self._num_active is not None or self._time_active):
             return                                   # busy setting things up
         if not all(self.gun_numbers):
             return
-        if ctypes.windll.user32.GetForegroundWindow() == self._own_hwnd:
+        fg = ctypes.windll.user32.GetForegroundWindow()
+        if fg == self._own_hwnd:
             return                                   # only fire when you're in the game
-        if self.runner.running:
+        if self.roblox_only and not self._fg_is_roblox(fg):
+            return
+        vks = [0x30 + int(n) for n in self.gun_numbers]   # DB, Rev, Tact
+        if self.hold_mode:
+            if not self.runner.running:
+                self.runner.start(vks, HOLD_MAX, False, self.jitter, self.mid_reload)
+        elif self.runner.running:
             self.runner.stop()                       # press again = stop early
         else:
-            vks = [0x30 + int(n) for n in self.gun_numbers]   # DB, Rev, Tact
-            self.runner.start(vks, self.run_time, self.auto_reload)
+            self.runner.start(vks, self.run_time, self.auto_reload, self.jitter)
 
     # ---------- Mode card: DB | Rev | Tact (+ number inputs) ----------
     def _build_mode_card(self):
@@ -1360,6 +1632,11 @@ class App(tk.Tk):
             self._capturing = False
             self._draw_keybox(self.keybind)
 
+        # panic key capture: only the panic box keeps it alive
+        if self._panic_capturing and e.widget is not self.panic_box:
+            self._panic_capturing = False
+            self._draw_panic()
+
         # run time input: only its box keeps it alive
         if self._time_active and e.widget is not self.timebox:
             self._finish_time()
@@ -1402,25 +1679,29 @@ class App(tk.Tk):
             return
         self.active_tab = idx
         self.page_title.config(text=TABS[idx])
+        for w in (self.mode_card, self.keybind_row, self.time_row,
+                  self.reload_row, self.extras_view, self.config_view):
+            w.pack_forget()
+        self._cancel_rename()
+        if self._num_active is not None:
+            self._finish_number()
+            self._draw_mode_card()
+        if self._capturing:
+            self._capturing = False
+            self._draw_keybox(self.keybind)
+        if self._panic_capturing:
+            self._panic_capturing = False
+            self._draw_panic()
+        self._finish_time()
+
         if idx == 0:
-            self._cancel_rename()
-            self.config_view.pack_forget()
             self.mode_card.pack(side="top", fill="x", padx=32, pady=(24, 0))
             self.keybind_row.pack(side="bottom", fill="x", padx=32, pady=(0, 28))
             self.time_row.pack(side="bottom", fill="x", padx=32, pady=(0, 10))
             self.reload_row.pack(side="bottom", fill="x", padx=32, pady=(0, 10))
+        elif idx == 1:
+            self.extras_view.pack(side="top", fill="both", expand=True)
         else:
-            self.mode_card.pack_forget()
-            self.keybind_row.pack_forget()
-            self.time_row.pack_forget()
-            self.reload_row.pack_forget()
-            if self._num_active is not None:
-                self._finish_number()
-                self._draw_mode_card()
-            if self._capturing:
-                self._capturing = False
-                self._draw_keybox(self.keybind)
-            self._finish_time()
             self._render_configs()
             self.config_view.pack(side="top", fill="both", expand=True)
 
