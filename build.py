@@ -1,20 +1,18 @@
 """
-Builds Loader.exe and GunMacro.exe and writes manifest.json.
+Builds GunMacro.exe and Loader.exe and writes manifest.json into ./release
 
-Usage (run on Windows):
-    python build.py 1.0.1
+You normally don't run this yourself: GitHub runs it for you every time you
+commit a change (see .github/workflows/release.yml).
 
-Put these next to this file:  gunmacro.py   loader.py   Icon.png
-Set REPO at the top of loader.py first (your public GitHub repo).
+To run it by hand (Windows):
+    python build.py 1.1.0
 
-Output goes to the "release" folder:
-    Loader.exe      give this to users (they only download it once)
-    GunMacro.exe    upload to a GitHub Release (tag v<version>)
-    manifest.json   upload to the SAME release
+Needs these next to this file:  gunmacro.py   loader.py   Icon.png
 """
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,10 +23,6 @@ APP_SCRIPT = os.path.join(HERE, "gunmacro.py")
 LOADER_SCRIPT = os.path.join(HERE, "loader.py")
 ICON_PNG = os.path.join(HERE, "Icon.png")
 OUT = os.path.join(HERE, "release")
-
-# Extra support files shipped next to GunMacro.exe (must sit in this folder).
-# Example: EXTRA_FILES = ["sounds.wav"]. Python code is already inside GunMacro.exe.
-EXTRA_FILES = []
 
 
 def pip_install(pkg):
@@ -42,6 +36,15 @@ def sha256(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def repo_from_loader():
+    """Read REPO from loader.py without importing it."""
+    with open(LOADER_SCRIPT, "r", encoding="utf-8") as f:
+        m = re.search(r'^REPO\s*=\s*"([^"]+)"', f.read(), re.M)
+    if not m:
+        sys.exit('Could not find REPO = "..." in loader.py')
+    return m.group(1)
 
 
 def pyinstaller(script, name, ico, work, extra=()):
@@ -63,16 +66,13 @@ def pyinstaller(script, name, ico, work, extra=()):
 
 def main():
     if len(sys.argv) != 2:
-        sys.exit("Usage: python build.py <version>   e.g. python build.py 1.0.1")
+        sys.exit("Usage: python build.py <version>   e.g. python build.py 1.1.0")
     version = sys.argv[1].strip().lstrip("v")
 
-    sys.path.insert(0, HERE)
-    import loader  # only to read REPO / LOADER_VERSION
-    if loader.REPO.startswith("YOUR_"):
-        sys.exit("Set REPO at the top of loader.py first (e.g. \"yourname/gunmacro\").")
     for p in (APP_SCRIPT, LOADER_SCRIPT, ICON_PNG):
         if not os.path.exists(p):
             sys.exit(f"Missing file: {p}")
+    repo = repo_from_loader()
 
     try:
         import PyInstaller  # noqa: F401
@@ -97,25 +97,21 @@ def main():
 
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
-    shipped = [("GunMacro.exe", app_exe)] + [(n, os.path.join(HERE, n)) for n in EXTRA_FILES]
-    base = f"https://github.com/{loader.REPO}/releases/download/v{version}"
-    files = []
-    for name, src in shipped:
-        dst = os.path.join(OUT, name)
-        shutil.copy2(src, dst)
-        files.append({"name": name, "url": f"{base}/{name}",
-                      "sha256": sha256(dst), "size": os.path.getsize(dst)})
+    app_dst = os.path.join(OUT, "GunMacro.exe")
+    shutil.copy2(app_exe, app_dst)
     shutil.copy2(loader_exe, os.path.join(OUT, "Loader.exe"))
 
-    manifest = {"version": version, "min_loader": loader.LOADER_VERSION, "files": files}
+    manifest = {
+        "version": version,
+        "url": f"https://github.com/{repo}/releases/download/v{version}/GunMacro.exe",
+        "sha256": sha256(app_dst),
+        "size": os.path.getsize(app_dst),
+    }
     with open(os.path.join(OUT, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     shutil.rmtree(work, ignore_errors=True)
 
     print(f"\nDone! Version {version} is in: {OUT}")
-    print(f"\nTo publish: on https://github.com/{loader.REPO}/releases create a release")
-    print(f"tagged v{version} and upload GunMacro.exe + manifest.json (plus any extra files).")
-    print("Users who already have Loader.exe will update the next time they open it.")
 
 
 if __name__ == "__main__":
