@@ -22,12 +22,13 @@ import time
 import urllib.error
 import urllib.request
 import tkinter as tk
+import tkinter.font as tkfont
 
 # ====================== SET THIS ONCE ======================
 REPO = "yghhujikl/gunmacro"
 # ===========================================================
 
-APP_NAME = "Gun macro"
+APP_NAME = "Gun Macro"
 EXE_NAME = "GunMacro.exe"
 IS_WIN = sys.platform == "win32"
 MANIFEST_URL = f"https://github.com/{REPO}/releases/latest/download/manifest.json"
@@ -41,15 +42,20 @@ MAX_FILE = 500 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 VER_RE = re.compile(r"^[0-9A-Za-z._-]{1,32}$")
 
-# ---------- theme (matches the main app) ----------
+# ---------- theme ----------
 BG, BAR = "#141414", "#0c0c0c"
-TEXT, SUBTEXT = "#e6e6e6", "#7a7a7a"
-TRACK, FILL, ERROR = "#2e2e2e", "#ffffff", "#e5737a"
+TEXT, SUBTEXT = "#f2f2f2", "#6d6d6d"
+LAV = "#8e89ad"                    # soft accent for the sub line
+TILE, TILE_LINE = "#0e0e0e", "#2b2b2b"
+TRACK, FILL, ERROR = "#2a2a2a", "#ffffff", "#e5737a"
 BTN, BTN_HOVER, BTN_TEXT = "#ffffff", "#e4e4e4", "#111111"
-CLOSE_HOVER = "#c42b1c"
-RADIUS = 12                        # window corner radius
+CLOSE_HOVER, BAR_HOVER = "#c42b1c", "#242424"
+RADIUS = 14                        # window corner radius
+TONES = {"idle": "#6f6f6f", "ok": "#5fd38d", "warn": "#e6b450", "err": "#e5737a"}
 
+GWL_STYLE = -16
 GWL_EXSTYLE = -20
+WS_MINIMIZEBOX = 0x00020000
 WS_EX_APPWINDOW = 0x00040000
 WS_EX_TOOLWINDOW = 0x00000080
 
@@ -214,22 +220,31 @@ def run(ui):
             raise UpdateError("Move Loader.exe to a folder you can write to, "
                               f"like your Desktop. ({e})", "Can't save here")
 
-        ui.status("Checking for updates")
+        ui.status("Checking for updates", "", "CHECKING", "idle")
         ui.progress(None)
         m = fetch_manifest()
-        ui.version(f"v{m['version']}")
+        ver = m["version"]
+        ui.version(f"v{ver}")
 
         if matches(final, m):
-            ui.progress(1)
-            ui.done("You're up to date", f"{APP_NAME} v{m['version']} is the latest version.")
+            ui.done("You're up to date", f"{APP_NAME} v{ver} is the latest version.",
+                    "UP TO DATE", "ok")
             return
 
         had_old = os.path.exists(final)
         if is_locked(final):
             raise UpdateError("Close it, then run the Loader again.", f"{APP_NAME} is open")
 
+        # nothing is installed until the user says so
+        if had_old:
+            ui.ask("Update found", f"{APP_NAME} v{ver} is ready to install.",
+                   "Update Gun Macro", "UPDATE FOUND", "warn")
+        else:
+            ui.ask("Everything. In sync.", f"Your {APP_NAME} starts here.",
+                   "Get Gun Macro", "READY", "ok")
+
         ui.status("Downloading update" if had_old else f"Downloading {APP_NAME}",
-                  f"v{m['version']}  ·  0%")
+                  f"v{ver}  ·  0%", "DOWNLOADING", "ok")
         ui.progress(0)
         last = [-1]
 
@@ -238,11 +253,12 @@ def run(ui):
             pct = int(frac * 100)
             if pct != last[0]:                 # don't flood the window with updates
                 last[0] = pct
-                ui.detail(f"v{m['version']}  ·  {pct}%")
+                ui.detail(f"v{ver}  ·  {pct}%")
 
         download(m, part, on_progress)
 
-        ui.status("Installing", "Replacing the old version" if had_old else "Saving the file")
+        ui.status("Installing", "Replacing the old version" if had_old else "Saving the file",
+                  "INSTALLING", "ok")
         ui.lock(True)                          # don't allow closing mid-swap
         try:
             os.replace(part, final)            # removes the old exe and puts the new one in its place
@@ -252,9 +268,9 @@ def run(ui):
         finally:
             ui.lock(False)
 
-        ui.progress(1)
-        ui.done("Update complete" if had_old else "Download complete",
-                f"{APP_NAME} v{m['version']} is saved next to this Loader.")
+        ui.done("Update complete" if had_old else "You're all set",
+                f"{APP_NAME} v{ver} is saved next to this Loader.",
+                "UPDATED" if had_old else "INSTALLED", "ok")
     finally:
         remove_quietly(part)
 
@@ -272,10 +288,37 @@ def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
     return canvas.create_polygon(rr_points(x1, y1, x2, y2, r), smooth=True, **kw)
 
 
+def mix(c1, c2, t):
+    """Blend hex colour c1 toward c2 by t (0..1)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+class SpacedLabel(tk.Canvas):
+    """Small-caps style text with extra space between the letters."""
+
+    def __init__(self, parent, text, font, fg, bg, spacing, height):
+        super().__init__(parent, bg=bg, highlightthickness=0, height=height)
+        self._font, self._fg, self._sp, self._h = font, fg, spacing, height
+        self.set_text(text)
+
+    def set_text(self, text, fg=None):
+        if fg:
+            self._fg = fg
+        self.delete("all")
+        x = 0
+        for ch in text:
+            self.create_text(x, self._h / 2, text=ch, anchor="w",
+                             font=self._font, fill=self._fg)
+            x += self._font.measure(ch) + self._sp
+        self.config(width=max(1, int(x - self._sp)))
+
+
 class LoaderUI(tk.Tk):
     # design size in pixels at 100% display scaling
-    W, H, BAR_H = 440, 286, 38
-    CONTENT_W, BAR_THICK, BTN_H = 370, 8, 42
+    W, H, BAR_H = 400, 330, 40
+    CONTENT_W, BAR_THICK, BTN_H = 340, 8, 44
 
     def __init__(self):
         super().__init__()
@@ -286,10 +329,27 @@ class LoaderUI(tk.Tk):
         self._drag_x = self._drag_y = 0
         self._closing = False
         self._locked = False
-        self._close_ready = False
+        self._mode = "busy"                 # busy | ask | done | fail
+        self._btn_ready = False
+        self._btn_text, self._btn_icon = "", False
+        self._click = None
+        self._cur_title = None
+        self._fade_job = None
         self._target, self._shown = None, 0.0
         self._q = queue.Queue()
 
+        self.f_mono = tkfont.Font(family="Consolas", size=8)
+        self.f_mono_b = tkfont.Font(family="Consolas", size=9, weight="bold")
+        self.f_big = tkfont.Font(family="Segoe UI Semibold", size=22)
+        self.f_mid = tkfont.Font(family="Segoe UI Semibold", size=16)
+        self.f_small = tkfont.Font(family="Segoe UI Semibold", size=13)
+        self.f_btn = tkfont.Font(family="Segoe UI Semibold", size=11)
+        self.f_brand = tkfont.Font(family="Segoe UI Semibold", size=15)
+
+        try:
+            self.attributes("-alpha", 0.0)        # fades in once it is ready
+        except tk.TclError:
+            pass
         self._load_icon()
         self.overrideredirect(True)
         self._build_bar()
@@ -297,9 +357,11 @@ class LoaderUI(tk.Tk):
         x = (self.winfo_screenwidth() - self.w) // 2
         y = (self.winfo_screenheight() - self.h) // 2
         self.geometry(f"{self.w}x{self.h}+{x}+{y}")
+        self.bind("<Return>", lambda e: self._on_button())
 
         self.after(50, self._setup_window)
-        self.after(40, self._pump)
+        self.after(160, self._fade_in)
+        self.after(33, self._pump)
         threading.Thread(target=self._work, daemon=True).start()
 
     def s(self, v):
@@ -324,35 +386,57 @@ class LoaderUI(tk.Tk):
             return
         user32 = ctypes.windll.user32
         hwnd = self._hwnd()
+        base = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        user32.SetWindowLongW(hwnd, GWL_STYLE, base | WS_MINIMIZEBOX)   # allows native minimize
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW     # show in the taskbar
+        style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW           # show in the taskbar
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
         self.withdraw()
         self.after(10, self.deiconify)
         r = self.s(RADIUS) * 2
         rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, self.w + 1, self.h + 1, r, r)
         user32.SetWindowRgn(hwnd, rgn, True)
+        self.after(80, self.focus_force)
+
+    def _fade_in(self, i=0):
+        steps = 10
+        try:
+            self.attributes("-alpha", min(1.0, i / steps))
+        except tk.TclError:
+            return
+        if i < steps:
+            self.after(16, lambda: self._fade_in(i + 1))
+
+    def _minimize(self):
+        if IS_WIN:
+            ctypes.windll.user32.ShowWindow(self._hwnd(), 6)      # SW_MINIMIZE
+        else:
+            self.overrideredirect(False)
+            self.iconify()
+
+    def _bar_button(self, parent, text, command, hover):
+        b = tk.Label(parent, text=text, bg=BAR, fg=TEXT, font=("Segoe UI", 11),
+                     width=4, cursor="hand2")
+        b.pack(side="right", fill="y")
+        b.bind("<Button-1>", lambda e: command())
+        b.bind("<Enter>", lambda e: b.config(bg=hover))
+        b.bind("<Leave>", lambda e: b.config(bg=BAR))
 
     def _build_bar(self):
-        bar = tk.Frame(self, bg=BAR, height=self.s(self.BAR_H))
+        s = self.s
+        bar = tk.Frame(self, bg=BAR, height=s(self.BAR_H))
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        title = tk.Label(bar, text=f"{APP_NAME} Loader", bg=BAR, fg=TEXT,
-                         font=("Segoe UI", 10, "bold"))
-        title.pack(side="left", padx=self.s(16))
+        left = SpacedLabel(bar, "GUN MACRO", self.f_mono_b, TEXT, BAR, s(2), s(self.BAR_H))
+        left.pack(side="left", padx=(s(18), 0))
 
-        x = tk.Label(bar, text="✕", bg=BAR, fg=TEXT, font=("Segoe UI", 11),
-                     width=5, cursor="hand2")
-        x.pack(side="right", fill="y")
-        x.bind("<Button-1>", lambda e: self._fade_close())
-        x.bind("<Enter>", lambda e: x.config(bg=CLOSE_HOVER))
-        x.bind("<Leave>", lambda e: x.config(bg=BAR))
+        self._bar_button(bar, "✕", self._fade_close, CLOSE_HOVER)
+        self._bar_button(bar, "—", self._minimize, BAR_HOVER)
+        self.top_right = SpacedLabel(bar, "LOADER", self.f_mono, SUBTEXT, BAR, s(2), s(self.BAR_H))
+        self.top_right.pack(side="right", padx=(0, s(8)))
 
-        self.ver_lbl = tk.Label(bar, text="", bg=BAR, fg=SUBTEXT, font=("Segoe UI", 9))
-        self.ver_lbl.pack(side="right", padx=(0, self.s(6)))
-
-        for w in (bar, title, self.ver_lbl):
+        for w in (bar, left, self.top_right):
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
 
@@ -383,54 +467,151 @@ class LoaderUI(tk.Tk):
 
     # ----- body -----
     def _build_body(self):
+        s = self.s
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
-        s = self.s
 
-        tk.Label(body, text=APP_NAME, bg=BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 22)).place(relx=0.5, y=s(24), anchor="n")
+        # wordmark tile (where the app icon used to be)
+        tw, th = s(176), s(46)
+        tile = tk.Canvas(body, width=tw, height=th, bg=BG, highlightthickness=0)
+        tile.place(relx=0.5, y=s(24), anchor="n")
+        rounded_rect(tile, 1, 1, tw - 1, th - 1, s(13), fill=TILE, outline=TILE_LINE)
+        tile.create_text(tw / 2, th / 2, text="Gun Macro", fill=TEXT, font=self.f_brand)
 
-        self.title_lbl = tk.Label(body, text="Starting", bg=BG, fg=TEXT,
-                                  font=("Segoe UI Semibold", 12))
-        self.title_lbl.place(relx=0.5, y=s(76), anchor="n")
-
-        self.detail_lbl = tk.Label(body, text="", bg=BG, fg=SUBTEXT, font=("Segoe UI", 10),
-                                   wraplength=s(self.CONTENT_W + 10), justify="center")
-        self.detail_lbl.place(relx=0.5, y=s(102), anchor="n")
+        self.title_lbl = tk.Label(body, text="Checking for updates", bg=BG, fg=TEXT,
+                                  font=self.f_big)
+        self.title_lbl.place(relx=0.5, y=s(106), anchor="center")
+        self.detail_lbl = tk.Label(body, text="", bg=BG, fg=LAV, font=("Segoe UI", 10),
+                                   wraplength=s(self.CONTENT_W), justify="center")
+        self.detail_lbl.place(relx=0.5, y=s(130), anchor="n")
 
         # progress bar (rounded track + rounded fill)
         self.bw, self.bh = s(self.CONTENT_W), s(self.BAR_THICK)
         self.bar = tk.Canvas(body, width=self.bw, height=self.bh, bg=BG, highlightthickness=0)
-        self.bar.place(relx=0.5, y=s(162), anchor="n")
         r = self.bh / 2
         rounded_rect(self.bar, 0, 0, self.bw, self.bh, r, fill=TRACK, outline=TRACK)
         self._fill = rounded_rect(self.bar, 0, 0, self.bh, self.bh, r, fill=FILL, outline=FILL,
                                   state="hidden")
+        self._bar_y = s(192) + s(self.BTN_H) // 2 - self.bh // 2
 
-        # close button: white, wide, rounded; appears when the Loader is finished
+        # main button: white, wide, rounded
         self.cw, self.ch = s(self.CONTENT_W), s(self.BTN_H)
-        self.close_cv = tk.Canvas(body, width=self.cw, height=self.ch, bg=BG,
-                                  highlightthickness=0)
-        self.close_cv.place(relx=0.5, y=s(186), anchor="n")
-        self.close_cv.bind("<Enter>", lambda e: self._close_ready and self._draw_close(BTN_HOVER))
-        self.close_cv.bind("<Leave>", lambda e: self._close_ready and self._draw_close(BTN))
-        self.close_cv.bind("<Button-1>", lambda e: self._close_ready and self._fade_close())
+        self.btn_cv = tk.Canvas(body, width=self.cw, height=self.ch, bg=BG, highlightthickness=0)
+        self.btn_cv.bind("<Enter>", lambda e: self._btn_ready and self._draw_button(BTN_HOVER))
+        self.btn_cv.bind("<Leave>", lambda e: self._btn_ready and self._draw_button(BTN))
+        self.btn_cv.bind("<Button-1>", lambda e: self._on_button())
+        self._show_progress()
 
-    def _draw_close(self, color):
-        c = self.close_cv
+        # footer: status dot + label on the left, state on the right
+        fy = s(262)
+        dot_d = s(7)
+        self.dot = tk.Canvas(body, width=dot_d, height=dot_d, bg=BG, highlightthickness=0)
+        self._dot_item = self.dot.create_oval(0, 0, dot_d - 1, dot_d - 1,
+                                              fill=TONES["idle"], outline=TONES["idle"])
+        self.dot.place(x=s(34), y=fy + s(5))
+        foot_l = SpacedLabel(body, "WINDOWS CLIENT", self.f_mono, "#5c5c5c", BG, s(1.5), s(16))
+        foot_l.place(x=s(48), y=fy)
+        self.tag_lbl = SpacedLabel(body, "CHECKING", self.f_mono, TONES["idle"], BG, s(1.5), s(16))
+        self.tag_lbl.place(relx=1, x=-s(34), y=fy, anchor="ne")
+
+    # ----- button / progress area -----
+    def _show_progress(self):
+        self._btn_ready = False
+        self.btn_cv.place_forget()
+        self.bar.place(relx=0.5, y=self._bar_y, anchor="n")
+
+    def _show_button(self, text, icon):
+        self.bar.place_forget()
+        self._btn_text, self._btn_icon = text, icon
+        self.btn_cv.place(relx=0.5, y=self.s(192), anchor="n")
+        self.btn_cv.config(cursor="hand2")
+        self._btn_ready = True
+        self._draw_button(BTN)
+
+    def _draw_button(self, color):
+        c, s = self.btn_cv, self.s
         c.delete("all")
-        rounded_rect(c, 1, 1, self.cw - 1, self.ch - 1, self.s(8), fill=color, outline=color)
-        c.create_text(self.cw / 2, self.ch / 2, text="Close", fill=BTN_TEXT,
-                      font=("Segoe UI Semibold", 12))
+        rounded_rect(c, 1, 1, self.cw - 1, self.ch - 1, s(10), fill=color, outline=color)
+        cy = self.ch / 2
+        tw = self.f_btn.measure(self._btn_text)
+        if self._btn_icon:
+            iw, gap = s(14), s(10)
+            x0 = (self.cw - (iw + gap + tw)) / 2
+            cx, lw = x0 + iw / 2, max(1, s(2))
+            c.create_line(cx, cy - s(7), cx, cy + s(3), fill=BTN_TEXT, width=lw, capstyle="round")
+            c.create_line(cx - s(4.5), cy - s(1), cx, cy + s(4), cx + s(4.5), cy - s(1),
+                          fill=BTN_TEXT, width=lw, capstyle="round", joinstyle="round")
+            c.create_line(cx - s(7), cy + s(8), cx + s(7), cy + s(8),
+                          fill=BTN_TEXT, width=lw, capstyle="round")
+            c.create_text(x0 + iw + gap, cy, text=self._btn_text, anchor="w",
+                          fill=BTN_TEXT, font=self.f_btn)
+        else:
+            c.create_text(self.cw / 2, cy, text=self._btn_text, fill=BTN_TEXT, font=self.f_btn)
 
-    def _show_close(self):
-        self._close_ready = True
-        self.close_cv.config(cursor="hand2")
-        self._draw_close(BTN)
+    def _on_button(self):
+        if not self._btn_ready:
+            return
+        if self._mode == "ask":
+            self._mode = "busy"
+            self._target, self._shown = 0.0, 0.0
+            self._show_progress()
+            if self._click:
+                self._click.set()              # lets the worker start the download
+        elif self._mode in ("done", "fail"):
+            self._fade_close()
+
+    # ----- text -----
+    def _title_font(self, text):
+        n = len(text)
+        return self.f_big if n <= 22 else self.f_mid if n <= 28 else self.f_small
+
+    def _set_text(self, title, detail, tfg, dfg):
+        changed = title != self._cur_title
+        self._cur_title = title
+        self.title_lbl.config(text=title, font=self._title_font(title))
+        self.detail_lbl.config(text=clip(detail))
+        if self._fade_job:
+            self.after_cancel(self._fade_job)
+            self._fade_job = None
+        if not changed:
+            self.title_lbl.config(fg=tfg)
+            self.detail_lbl.config(fg=dfg)
+            return
+        self.title_lbl.config(fg=BG)
+        self.detail_lbl.config(fg=BG)
+        steps = 8
+
+        def step(i=1):
+            t = i / steps
+            self.title_lbl.config(fg=mix(BG, tfg, t))
+            self.detail_lbl.config(fg=mix(BG, dfg, t))
+            if i < steps:
+                self._fade_job = self.after(18, lambda: step(i + 1))
+            else:
+                self._fade_job = None
+
+        step()
+
+    def _set_tag(self, text, tone):
+        col = TONES[tone]
+        self.tag_lbl.set_text(text, col)
+        self.dot.itemconfigure(self._dot_item, fill=col, outline=col)
 
     # ----- thread-safe API used by the worker -----
-    def status(self, title, detail=""):
-        self._q.put(("status", title, detail))
+    def status(self, title, detail="", tag="", tone="idle"):
+        self._q.put(("show", "busy", title, detail, tag, tone, ""))
+
+    def ask(self, title, detail, button, tag, tone):
+        """Show a message and a button; wait until the user presses it."""
+        self._click = threading.Event()
+        self._q.put(("show", "ask", title, detail, tag, tone, button))
+        self._click.wait()
+
+    def done(self, title, detail="", tag="", tone="ok"):
+        self._q.put(("show", "done", title, detail, tag, tone, ""))
+
+    def fail(self, title, detail=""):
+        self._q.put(("show", "fail", title, detail, "ERROR", "err", ""))
 
     def detail(self, text):
         self._q.put(("detail", text))
@@ -443,12 +624,6 @@ class LoaderUI(tk.Tk):
 
     def lock(self, on):
         self._q.put(("lock", on))
-
-    def done(self, title, detail=""):
-        self._q.put(("done", title, detail))
-
-    def fail(self, title, detail=""):
-        self._q.put(("fail", title, detail))
 
     def _work(self):
         try:
@@ -463,13 +638,24 @@ class LoaderUI(tk.Tk):
             while True:
                 item = self._q.get_nowait()
                 kind = item[0]
-                if kind == "status":
-                    self.title_lbl.config(text=item[1], fg=TEXT)
-                    self.detail_lbl.config(text=clip(item[2]))
+                if kind == "show":
+                    _, mode, title, detail, tag, tone, button = item
+                    self._mode = mode
+                    self._set_text(title, detail, ERROR if mode == "fail" else TEXT,
+                                   SUBTEXT if mode == "fail" else LAV)
+                    if tag:
+                        self._set_tag(tag, tone)
+                    if mode == "busy":
+                        self._show_progress()
+                    elif mode == "ask":
+                        self._show_button(button, True)
+                    else:
+                        self._target = 1.0 if mode == "done" else 0.0
+                        self._show_button("Close", False)
                 elif kind == "detail":
                     self.detail_lbl.config(text=clip(item[1]))
                 elif kind == "version":
-                    self.ver_lbl.config(text=item[1])
+                    self.top_right.set_text(f"LOADER  {item[1].upper()}")
                 elif kind == "progress":
                     if item[1] is None:
                         self._target = None
@@ -479,20 +665,10 @@ class LoaderUI(tk.Tk):
                         self._target = max(0.0, min(1.0, item[1]))
                 elif kind == "lock":
                     self._locked = item[1]
-                elif kind == "done":
-                    self.title_lbl.config(text=item[1], fg=TEXT)
-                    self.detail_lbl.config(text=clip(item[2]))
-                    self._target = 1.0
-                    self._show_close()
-                elif kind == "fail":
-                    self.title_lbl.config(text=item[1], fg=ERROR)
-                    self.detail_lbl.config(text=clip(item[2]))
-                    self._target, self._shown = 0.0, 0.0
-                    self._show_close()
         except queue.Empty:
             pass
         self._draw_bar()
-        self.after(40, self._pump)
+        self.after(33, self._pump)
 
     def _draw_bar(self):
         bw, bh = self.bw, self.bh
@@ -515,7 +691,7 @@ class LoaderUI(tk.Tk):
 def main():
     if IS_WIN:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gunmacro.loader.3")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gunmacro.loader.4")
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
