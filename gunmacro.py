@@ -7,6 +7,8 @@ import re
 import subprocess
 import threading
 import time
+import urllib.request
+from datetime import datetime
 import tkinter as tk
 import tkinter.font as tkfont
 
@@ -27,6 +29,20 @@ ICON_CANDIDATES = [
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 CONFIG_DIR = os.path.join(DATA_DIR, "configs")
 SESSION_FILE = os.path.join(DATA_DIR, "last_session.json")
+META_FILE = os.path.join(DATA_DIR, "meta.json")                 # remembers when you last used it
+
+# ---------- Version + update check ----------
+VERSION = "1.0.0"          # bump this on every release
+# Where to look for the newest version number. Set ONE of these:
+#   UPDATE_URL  - a link to a text file ("1.2.0") or JSON ({"version": "1.2.0"})
+#   UPDATE_FILE - a local file your Loader writes the newest version into
+# With neither set, the update status is simply hidden.
+UPDATE_URL = ""
+UPDATE_FILE = os.path.join(ROOT_DIR, "latest_version.txt")
+UPDATE_OK = "#7bc88f"
+UPDATE_NEW = "#e5b567"
+COPY_OK = "#7bc88f"
+DISCORD_NAME = "@reruinz"
 
 # ---------- Theme ----------
 BG = "#141414"
@@ -386,6 +402,70 @@ def ease_in_out(t):
     return t * t * (3 - 2 * t)
 
 
+def parse_version(text):
+    nums = [int(n) for n in re.findall(r"\d+", str(text))][:4]
+    return tuple(nums + [0] * (4 - len(nums)))
+
+
+def _clean_version(raw):
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            raw = str(data.get("version") or data.get("latest") or "")
+    except ValueError:
+        pass
+    raw = raw.splitlines()[0].strip() if raw else ""
+    return raw.lstrip("vV") if re.search(r"\d", raw) else None
+
+
+def fetch_latest_version():
+    """('ok', '1.2.0') or ('error', None). Runs on a background thread."""
+    try:
+        if UPDATE_URL:
+            with urllib.request.urlopen(UPDATE_URL, timeout=4) as r:
+                raw = r.read(4096).decode("utf-8", "ignore")
+        else:
+            with open(UPDATE_FILE, "r", encoding="utf-8") as f:
+                raw = f.read(4096)
+    except (OSError, ValueError):
+        return ("error", None)
+    v = _clean_version(raw)
+    return ("ok", v) if v else ("error", None)
+
+
+def load_last_used():
+    d = read_json(META_FILE)
+    try:
+        return datetime.fromisoformat(d["last_used"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def touch_last_used():
+    write_json(META_FILE, {"last_used": datetime.now().isoformat(timespec="seconds")})
+
+
+def describe_last_used(dt, now=None):
+    """'Last used: Yesterday at 3:42 PM' / 'Tuesday at ...' / 'Tuesday, Oct 6 at ...'."""
+    if dt is None:
+        return "Welcome! First time here"
+    now = now or datetime.now()
+    days = (now.date() - dt.date()).days
+    clock = dt.strftime("%I:%M %p").lstrip("0")
+    if days <= 0:
+        day = "Today"
+    elif days == 1:
+        day = "Yesterday"
+    elif days < 7:
+        day = dt.strftime("%A")
+    elif dt.year == now.year:
+        day = f"{dt.strftime('%A, %b')} {dt.day}"
+    else:
+        day = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    return f"Last used: {day} at {clock}"
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -399,6 +479,7 @@ class App(tk.Tk):
         self._build_top_bar()
         self._build_body()
         self._center()
+        self._start_update_check()
 
         self.after(50, self._setup_window)
 
@@ -449,6 +530,7 @@ class App(tk.Tk):
         self._closing = True
         if getattr(self, "_main_built", False):
             self._save_session()
+            touch_last_used()                  # remember when you last used it
         self._poll_stop = True
         if getattr(self, "runner", None):
             self.runner.stop()
@@ -514,10 +596,20 @@ class App(tk.Tk):
 
         self.heading = tk.Label(body, text="Gun macro", bg=BG, fg=TEXT,
                                 font=("Segoe UI Semibold", 28))
-        self.heading.pack(pady=(56, 4))
+        self.heading.pack(pady=(40, 2))
         self.subtitle = tk.Label(body, text="Built for zee hood", bg=BG, fg=SUBTEXT,
                                  font=("Segoe UI", 10))
-        self.subtitle.pack(pady=(0, 40))
+        self.subtitle.pack(pady=(0, 4))
+
+        # version + update status
+        self.ver_row = tk.Frame(body, bg=BG)
+        self.ver_row.pack(pady=(0, 22))
+        self.ver_label = tk.Label(self.ver_row, text=f"v{VERSION}", bg=BG, fg=SUBTEXT,
+                                  font=("Segoe UI", 9))
+        self.ver_label.pack(side="left")
+        self.update_label = tk.Label(self.ver_row, text="", bg=BG, fg=SUBTEXT,
+                                     font=("Segoe UI", 9))
+        self.update_label.pack(side="left")
 
         bw, bh = 360, 50
         cv = tk.Canvas(body, width=bw, height=bh, bg=BG,
@@ -537,6 +629,84 @@ class App(tk.Tk):
         cv.bind("<Leave>", lambda e: hover(BTN))
         cv.bind("<Button-1>", lambda e: self.on_continue())
 
+        # when you last used it
+        self._prev_used = load_last_used()
+        self.last_used_label = tk.Label(body, text=describe_last_used(self._prev_used),
+                                        bg=BG, fg=SUBTEXT, font=("Segoe UI", 9))
+        self.last_used_label.pack(pady=(14, 0))
+
+        # clickable credit: copies the Discord name
+        self._copied = False
+        self._copy_job = None
+        self.credit = tk.Label(body, text=f"Made by reruinz  \u00b7  Discord {DISCORD_NAME}",
+                               bg=BG, fg=SUBTEXT, font=("Segoe UI", 9), cursor="hand2")
+        self.credit.pack(side="bottom", pady=(0, 14))
+        self.credit.bind("<Enter>", lambda e: None if self._copied else self.credit.config(fg=TEXT))
+        self.credit.bind("<Leave>", lambda e: None if self._copied else self.credit.config(fg=SUBTEXT))
+        self.credit.bind("<Button-1>", lambda e: self._copy_credit())
+
+    # ---------- Splash extras: copy credit + update check ----------
+    def _copy_credit(self):
+        text = DISCORD_NAME
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()                      # lets the clipboard keep it after we close
+        except tk.TclError:
+            pass
+        if IS_WIN:                             # clip.exe also keeps it after the app exits
+            try:
+                subprocess.run(["clip"], input=text.encode("ascii", "ignore"),
+                               creationflags=0x08000000, check=False)
+            except OSError:
+                pass
+        if self._copy_job:
+            self.after_cancel(self._copy_job)
+        self._copied = True
+        self.credit.config(text=f"Copied {text} to clipboard", fg=COPY_OK)
+
+        def restore():
+            self._copied = False
+            self._copy_job = None
+            try:
+                self.credit.config(text=f"Made by reruinz  \u00b7  Discord {DISCORD_NAME}",
+                                   fg=SUBTEXT)
+            except tk.TclError:
+                pass
+
+        self._copy_job = self.after(1600, restore)
+
+    def _start_update_check(self):
+        self._update_result = None
+        if not (UPDATE_URL or os.path.isfile(UPDATE_FILE)):
+            return                             # nothing configured: show nothing
+        self.update_label.config(text="  \u00b7  Checking for updates...", fg=SUBTEXT)
+
+        def work():
+            self._update_result = fetch_latest_version()
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll_update)
+
+    def _poll_update(self):
+        if getattr(self, "_closing", False):
+            return
+        res = self._update_result
+        if res is None:
+            self.after(150, self._poll_update)
+            return
+        kind, latest = res
+        if kind == "ok" and parse_version(latest) > parse_version(VERSION):
+            text, color = f"  \u00b7  Update available (v{latest})", UPDATE_NEW
+        elif kind == "ok":
+            text, color = "  \u00b7  Up to date", UPDATE_OK
+        else:
+            text, color = "  \u00b7  Couldn't check for updates", SUBTEXT
+        try:
+            self.update_label.config(text=text, fg=color)
+        except tk.TclError:
+            pass
+
     def _set_frame(self, x, y, w, h):
         """Resize/move in one native call; region is updated first so the
         window never gets clipped by an outdated shape."""
@@ -550,22 +720,51 @@ class App(tk.Tk):
         if getattr(self, "_animating", False):
             return
         self._animating = True
-        self.btn_cv.config(cursor="arrow")
+        touch_last_used()                           # starting counts as using it
+        self._preloaded = read_json(SESSION_FILE)   # real work while the bar runs
+
+        # Phase 0: the button turns into a loading bar
+        cv = self.btn_cv
+        for seq in ("<Enter>", "<Leave>", "<Button-1>"):
+            cv.unbind(seq)
+        cv.config(cursor="arrow")
+        cv.delete("all")
+        bw = int(cv.cget("width"))
+        cv.create_text(bw / 2, 12, text="Loading...", fill=SUBTEXT,
+                       font=("Segoe UI", 10), tags="barlabel")
+        rounded_rect(cv, 0, 30, bw, 38, 4, fill=KEYBOX, outline=KEYBOX, tags="bartrack")
+        load_steps = 44
+
+        def load(i=0):
+            t = ease_in_out(i / load_steps)
+            cv.delete("barfill")
+            if i:
+                rounded_rect(cv, 0, 30, max(9, bw * t), 38, 4, fill=BTN, outline=BTN,
+                             tags="barfill")
+            if i < load_steps:
+                self.after(16, lambda: load(i + 1))
+            else:
+                fade()
 
         # Phase 1: fade the content out (window size stays fixed = no flicker)
         fade_steps = 14
+        labels = [self.heading, self.subtitle, self.ver_label, self.update_label,
+                  self.last_used_label, self.credit]
 
         def fade(i=0):
+            if i == 0:
+                self._fade_bases = [(w, str(w.cget("fg"))) for w in labels]
             f = i / fade_steps
-            c_btn = mix(BTN, BG, f)
-            self.heading.config(fg=mix(TEXT, BG, f))
-            self.subtitle.config(fg=mix(SUBTEXT, BG, f))
-            self.btn_cv.itemconfig(self.btn_shape, fill=c_btn, outline=c_btn)
-            self.btn_cv.itemconfig(self.btn_text, fill=mix(BTN_TEXT, BG, f))
+            for w, base in self._fade_bases:
+                w.config(fg=mix(base, BG, f))
+            cv.itemconfig("barlabel", fill=mix(SUBTEXT, BG, f))
+            cv.itemconfig("bartrack", fill=mix(KEYBOX, BG, f), outline=mix(KEYBOX, BG, f))
+            cv.itemconfig("barfill", fill=mix(BTN, BG, f), outline=mix(BTN, BG, f))
             if i < fade_steps:
                 self.after(16, lambda: fade(i + 1))
             else:
-                for wdg in (self.heading, self.subtitle, self.btn_cv):
+                for wdg in (self.heading, self.subtitle, self.ver_row, self.btn_cv,
+                            self.last_used_label, self.credit):
                     wdg.pack_forget()
                 self.update_idletasks()
                 grow()
@@ -596,7 +795,7 @@ class App(tk.Tk):
 
             step()
 
-        fade()
+        load()
 
     # ---------- Main screen (sidebar + tabs) ----------
     def _tab_y(self, idx):
@@ -657,7 +856,10 @@ class App(tk.Tk):
 
         # restore what you had last time, then keep saving it
         self._saved_snapshot = None
-        self._apply_snapshot(read_json(SESSION_FILE) or {})
+        data = getattr(self, "_preloaded", None)
+        if not isinstance(data, dict):
+            data = read_json(SESSION_FILE) or {}
+        self._apply_snapshot(data)
         self._main_built = True
         self._autosave_tick()
 
