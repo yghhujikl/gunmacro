@@ -9,6 +9,7 @@ version is downloaded, verified (SHA-256), and replaces the old GunMacro.exe.
 
 Your settings live in %LOCALAPPDATA%\GunMacro\data and are never touched.
 """
+import ctypes
 import hashlib
 import http.client
 import json
@@ -28,6 +29,7 @@ REPO = "yghhujikl/gunmacro"
 
 APP_NAME = "Gun macro"
 EXE_NAME = "GunMacro.exe"
+IS_WIN = sys.platform == "win32"
 MANIFEST_URL = f"https://github.com/{REPO}/releases/latest/download/manifest.json"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/".lower()
 
@@ -39,12 +41,23 @@ MAX_FILE = 500 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 VER_RE = re.compile(r"^[0-9A-Za-z._-]{1,32}$")
 
-BG, TEXT = "#141414", "#e6e6e6"
+# ---------- theme (matches the main app) ----------
+BG, BAR = "#141414", "#0c0c0c"
+TEXT, SUBTEXT = "#e6e6e6", "#7a7a7a"
 TRACK, FILL, ERROR = "#2e2e2e", "#ffffff", "#e5737a"
+BTN, BTN_HOVER, BTN_TEXT = "#ffffff", "#e4e4e4", "#111111"
+CLOSE_HOVER = "#c42b1c"
+RADIUS = 12                        # window corner radius
+
+GWL_EXSTYLE = -20
+WS_EX_APPWINDOW = 0x00040000
+WS_EX_TOOLWINDOW = 0x00000080
 
 
 class UpdateError(Exception):
-    pass
+    def __init__(self, message, title="Update failed"):
+        super().__init__(message)
+        self.title = title
 
 
 class BadDownload(OSError):
@@ -96,19 +109,24 @@ def remove_quietly(path):
         pass
 
 
+def clip(text, n=150):
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
 # ---------- network ----------
 def open_url(url):
     if not url.lower().startswith("https://"):
-        raise UpdateError("Refusing to use a non-HTTPS address.")
-    req = urllib.request.Request(url, headers={"User-Agent": "GunMacroLoader/2"})
+        raise UpdateError("Refusing to use a non-HTTPS address.", "Blocked for safety")
+    req = urllib.request.Request(url, headers={"User-Agent": "GunMacroLoader/3"})
     resp = urllib.request.urlopen(req, timeout=TIMEOUT)
     if not resp.geturl().lower().startswith("https://"):
         resp.close()
-        raise UpdateError("The server redirected to a non-HTTPS address.")
+        raise UpdateError("The server redirected to a non-HTTPS address.", "Blocked for safety")
     return resp
 
 
-def with_retries(what, fn):
+def with_retries(title, fn):
     """Run fn(); retry on network trouble, give up at once on 'not found' style errors."""
     last = None
     for attempt in range(RETRIES):
@@ -118,24 +136,26 @@ def with_retries(what, fn):
             raise
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                raise UpdateError(f"{what}: not found (404). Has a release been published on GitHub?")
+                raise UpdateError("GitHub answered 404 (not found). Make sure a release "
+                                  "is published on the repo.", title)
             if 400 <= e.code < 500:
-                raise UpdateError(f"{what}: the server answered HTTP {e.code}.")
+                raise UpdateError(f"The server answered HTTP {e.code}.", title)
             last = e
         except (OSError, http.client.HTTPException) as e:
             last = e
         time.sleep(1.5 * (attempt + 1))
-    raise UpdateError(f"{what} failed. Check your internet connection. ({last})")
+    raise UpdateError(f"Check your internet connection and try again. ({last})", title)
 
 
 def fetch_manifest():
-    bad = UpdateError("The update info from the server is invalid.")
+    title = "Couldn't check for updates"
+    bad = UpdateError("The update info from the server is invalid.", title)
 
     def get():
         with open_url(MANIFEST_URL) as resp:
             return resp.read(MAX_MANIFEST + 1)
 
-    raw = with_retries("Checking for updates", get)
+    raw = with_retries(title, get)
     if len(raw) > MAX_MANIFEST:
         raise bad
     try:
@@ -177,7 +197,7 @@ def download(manifest, dest, progress):
         if h.hexdigest() != manifest["sha256"]:
             raise BadDownload("integrity check failed")
 
-    with_retries(f"Downloading {EXE_NAME}", get)
+    with_retries("Download failed", get)
 
 
 # ---------- main flow ----------
@@ -191,75 +211,101 @@ def run(ui):
             with open(part, "wb"):
                 pass
         except OSError as e:
-            raise UpdateError(
-                f"Can't write to this folder. Move Loader.exe somewhere like your Desktop. ({e})")
+            raise UpdateError("Move Loader.exe to a folder you can write to, "
+                              f"like your Desktop. ({e})", "Can't save here")
 
-        ui.status("Checking for updates...")
+        ui.status("Checking for updates")
         ui.progress(None)
         m = fetch_manifest()
+        ui.version(f"v{m['version']}")
 
         if matches(final, m):
             ui.progress(1)
-            ui.done(f"You already have the latest version (v{m['version']}).")
+            ui.done("You're up to date", f"{APP_NAME} v{m['version']} is the latest version.")
             return
 
         had_old = os.path.exists(final)
         if is_locked(final):
-            raise UpdateError(f"{APP_NAME} is open. Close it, then run the Loader again.")
+            raise UpdateError("Close it, then run the Loader again.", f"{APP_NAME} is open")
 
-        ui.status(f"{'Updating to' if had_old else 'Downloading'} v{m['version']}...")
+        ui.status("Downloading update" if had_old else f"Downloading {APP_NAME}",
+                  f"v{m['version']}  ·  0%")
         ui.progress(0)
-        download(m, part, ui.progress)
+        last = [-1]
 
-        ui.status("Installing...")
-        ui.lock(True)                      # don't allow closing mid-swap
+        def on_progress(frac):
+            ui.progress(frac)
+            pct = int(frac * 100)
+            if pct != last[0]:                 # don't flood the window with updates
+                last[0] = pct
+                ui.detail(f"v{m['version']}  ·  {pct}%")
+
+        download(m, part, on_progress)
+
+        ui.status("Installing", "Replacing the old version" if had_old else "Saving the file")
+        ui.lock(True)                          # don't allow closing mid-swap
         try:
-            os.replace(part, final)        # removes the old exe and puts the new one in its place
+            os.replace(part, final)            # removes the old exe and puts the new one in its place
         except OSError as e:
-            raise UpdateError(f"Couldn't replace the old {EXE_NAME}. Is it open? ({e})")
+            raise UpdateError("The file couldn't be replaced. Make sure "
+                              f"{APP_NAME} is closed. ({e})", "Couldn't install the update")
         finally:
             ui.lock(False)
 
         ui.progress(1)
-        ui.done(f"{'Updated to' if had_old else 'Downloaded'} v{m['version']}.\n"
-                f"{EXE_NAME} is in the same folder as this Loader.")
+        ui.done("Update complete" if had_old else "Download complete",
+                f"{APP_NAME} v{m['version']} is saved next to this Loader.")
     finally:
         remove_quietly(part)
 
 
 # ---------- window ----------
+def rr_points(x1, y1, x2, y2, r):
+    return [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+
+
+def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
+    return canvas.create_polygon(rr_points(x1, y1, x2, y2, r), smooth=True, **kw)
+
+
 class LoaderUI(tk.Tk):
-    W = 370
+    # design size in pixels at 100% display scaling
+    W, H, BAR_H = 440, 286, 38
+    CONTENT_W, BAR_THICK, BTN_H = 370, 8, 42
 
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} Loader")
         self.configure(bg=BG)
-        self.resizable(False, False)
-        w, h = 420, 230
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self._load_icon()
-
-        tk.Label(self, text=APP_NAME, bg=BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 18)).pack(pady=(22, 2))
-        self.status_lbl = tk.Label(self, text="Starting...", bg=BG, fg=TEXT,
-                                   font=("Segoe UI", 10), wraplength=380, justify="center")
-        self.status_lbl.pack(pady=(6, 12))
-        self.bar = tk.Canvas(self, width=self.W, height=8, bg=TRACK, highlightthickness=0)
-        self.bar.pack()
-        self._fill = self.bar.create_rectangle(0, 0, 0, 8, fill=FILL, outline=FILL)
-        self.close_btn = tk.Button(self, text="Close", command=self.destroy, bg="#2a2a2a",
-                                   fg=TEXT, relief="flat", padx=16, pady=4, cursor="hand2")
-
-        self._frac = None
+        self.k = max(1.0, self.winfo_fpixels("1i") / 96.0)      # display scaling
+        self.w, self.h = self.s(self.W), self.s(self.H)
+        self._drag_x = self._drag_y = 0
+        self._closing = False
         self._locked = False
+        self._close_ready = False
+        self._target, self._shown = None, 0.0
         self._q = queue.Queue()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._load_icon()
+        self.overrideredirect(True)
+        self._build_bar()
+        self._build_body()
+        x = (self.winfo_screenwidth() - self.w) // 2
+        y = (self.winfo_screenheight() - self.h) // 2
+        self.geometry(f"{self.w}x{self.h}+{x}+{y}")
+
+        self.after(50, self._setup_window)
         self.after(40, self._pump)
         threading.Thread(target=self._work, daemon=True).start()
 
+    def s(self, v):
+        return int(round(v * self.k))
+
+    # ----- window chrome -----
     def _load_icon(self):
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(base, "Icon.png")
@@ -270,13 +316,127 @@ class LoaderUI(tk.Tk):
             except tk.TclError:
                 pass
 
-    def _on_close(self):
-        if not self._locked:
-            self.destroy()
+    def _hwnd(self):
+        return ctypes.windll.user32.GetParent(self.winfo_id())
 
-    # thread-safe API used by the worker
-    def status(self, text):
-        self._q.put(("status", text))
+    def _setup_window(self):
+        if not IS_WIN:
+            return
+        user32 = ctypes.windll.user32
+        hwnd = self._hwnd()
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW     # show in the taskbar
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        self.withdraw()
+        self.after(10, self.deiconify)
+        r = self.s(RADIUS) * 2
+        rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, self.w + 1, self.h + 1, r, r)
+        user32.SetWindowRgn(hwnd, rgn, True)
+
+    def _build_bar(self):
+        bar = tk.Frame(self, bg=BAR, height=self.s(self.BAR_H))
+        bar.pack(fill="x", side="top")
+        bar.pack_propagate(False)
+
+        title = tk.Label(bar, text=f"{APP_NAME} Loader", bg=BAR, fg=TEXT,
+                         font=("Segoe UI", 10, "bold"))
+        title.pack(side="left", padx=self.s(16))
+
+        x = tk.Label(bar, text="✕", bg=BAR, fg=TEXT, font=("Segoe UI", 11),
+                     width=5, cursor="hand2")
+        x.pack(side="right", fill="y")
+        x.bind("<Button-1>", lambda e: self._fade_close())
+        x.bind("<Enter>", lambda e: x.config(bg=CLOSE_HOVER))
+        x.bind("<Leave>", lambda e: x.config(bg=BAR))
+
+        self.ver_lbl = tk.Label(bar, text="", bg=BAR, fg=SUBTEXT, font=("Segoe UI", 9))
+        self.ver_lbl.pack(side="right", padx=(0, self.s(6)))
+
+        for w in (bar, title, self.ver_lbl):
+            w.bind("<Button-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._on_drag)
+
+    def _start_drag(self, e):
+        self._drag_x, self._drag_y = e.x_root - self.winfo_x(), e.y_root - self.winfo_y()
+
+    def _on_drag(self, e):
+        self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+
+    def _fade_close(self):
+        if self._locked or self._closing:        # never close in the middle of swapping files
+            return
+        self._closing = True
+        steps = 12
+
+        def step(i=0):
+            try:
+                self.attributes("-alpha", max(1 - i / steps, 0))
+            except tk.TclError:
+                self.destroy()
+                return
+            if i < steps:
+                self.after(14, lambda: step(i + 1))
+            else:
+                self.destroy()
+
+        step()
+
+    # ----- body -----
+    def _build_body(self):
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True)
+        s = self.s
+
+        tk.Label(body, text=APP_NAME, bg=BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 22)).place(relx=0.5, y=s(24), anchor="n")
+
+        self.title_lbl = tk.Label(body, text="Starting", bg=BG, fg=TEXT,
+                                  font=("Segoe UI Semibold", 12))
+        self.title_lbl.place(relx=0.5, y=s(76), anchor="n")
+
+        self.detail_lbl = tk.Label(body, text="", bg=BG, fg=SUBTEXT, font=("Segoe UI", 10),
+                                   wraplength=s(self.CONTENT_W + 10), justify="center")
+        self.detail_lbl.place(relx=0.5, y=s(102), anchor="n")
+
+        # progress bar (rounded track + rounded fill)
+        self.bw, self.bh = s(self.CONTENT_W), s(self.BAR_THICK)
+        self.bar = tk.Canvas(body, width=self.bw, height=self.bh, bg=BG, highlightthickness=0)
+        self.bar.place(relx=0.5, y=s(162), anchor="n")
+        r = self.bh / 2
+        rounded_rect(self.bar, 0, 0, self.bw, self.bh, r, fill=TRACK, outline=TRACK)
+        self._fill = rounded_rect(self.bar, 0, 0, self.bh, self.bh, r, fill=FILL, outline=FILL,
+                                  state="hidden")
+
+        # close button: white, wide, rounded; appears when the Loader is finished
+        self.cw, self.ch = s(self.CONTENT_W), s(self.BTN_H)
+        self.close_cv = tk.Canvas(body, width=self.cw, height=self.ch, bg=BG,
+                                  highlightthickness=0)
+        self.close_cv.place(relx=0.5, y=s(186), anchor="n")
+        self.close_cv.bind("<Enter>", lambda e: self._close_ready and self._draw_close(BTN_HOVER))
+        self.close_cv.bind("<Leave>", lambda e: self._close_ready and self._draw_close(BTN))
+        self.close_cv.bind("<Button-1>", lambda e: self._close_ready and self._fade_close())
+
+    def _draw_close(self, color):
+        c = self.close_cv
+        c.delete("all")
+        rounded_rect(c, 1, 1, self.cw - 1, self.ch - 1, self.s(8), fill=color, outline=color)
+        c.create_text(self.cw / 2, self.ch / 2, text="Close", fill=BTN_TEXT,
+                      font=("Segoe UI Semibold", 12))
+
+    def _show_close(self):
+        self._close_ready = True
+        self.close_cv.config(cursor="hand2")
+        self._draw_close(BTN)
+
+    # ----- thread-safe API used by the worker -----
+    def status(self, title, detail=""):
+        self._q.put(("status", title, detail))
+
+    def detail(self, text):
+        self._q.put(("detail", text))
+
+    def version(self, text):
+        self._q.put(("version", text))
 
     def progress(self, frac):
         self._q.put(("progress", frac))
@@ -284,19 +444,19 @@ class LoaderUI(tk.Tk):
     def lock(self, on):
         self._q.put(("lock", on))
 
-    def done(self, text):
-        self._q.put(("done", text))
+    def done(self, title, detail=""):
+        self._q.put(("done", title, detail))
 
-    def fail(self, text):
-        self._q.put(("fail", text))
+    def fail(self, title, detail=""):
+        self._q.put(("fail", title, detail))
 
     def _work(self):
         try:
             run(self)
         except UpdateError as e:
-            self.fail(str(e))
+            self.fail(e.title, str(e))
         except Exception as e:  # last-resort safety net
-            self.fail(f"Something went wrong. ({e})")
+            self.fail("Something went wrong", str(e))
 
     def _pump(self):
         try:
@@ -304,37 +464,58 @@ class LoaderUI(tk.Tk):
                 item = self._q.get_nowait()
                 kind = item[0]
                 if kind == "status":
-                    self.status_lbl.config(text=item[1], fg=TEXT)
+                    self.title_lbl.config(text=item[1], fg=TEXT)
+                    self.detail_lbl.config(text=clip(item[2]))
+                elif kind == "detail":
+                    self.detail_lbl.config(text=clip(item[1]))
+                elif kind == "version":
+                    self.ver_lbl.config(text=item[1])
                 elif kind == "progress":
-                    self._frac = item[1]
+                    if item[1] is None:
+                        self._target = None
+                    else:
+                        if self._target is None:
+                            self._shown = 0.0
+                        self._target = max(0.0, min(1.0, item[1]))
                 elif kind == "lock":
                     self._locked = item[1]
                 elif kind == "done":
-                    self.status_lbl.config(text=item[1], fg=TEXT)
-                    self._frac = 1
-                    self.close_btn.pack(pady=(14, 0))
+                    self.title_lbl.config(text=item[1], fg=TEXT)
+                    self.detail_lbl.config(text=clip(item[2]))
+                    self._target = 1.0
+                    self._show_close()
                 elif kind == "fail":
-                    self.status_lbl.config(text=item[1], fg=ERROR)
-                    self._frac = 0
-                    self.close_btn.pack(pady=(14, 0))
+                    self.title_lbl.config(text=item[1], fg=ERROR)
+                    self.detail_lbl.config(text=clip(item[2]))
+                    self._target, self._shown = 0.0, 0.0
+                    self._show_close()
         except queue.Empty:
             pass
         self._draw_bar()
         self.after(40, self._pump)
 
     def _draw_bar(self):
-        if self._frac is None:        # unknown length: sliding block
-            pos = (time.time() * 320) % (self.W + 90) - 90
-            self.bar.coords(self._fill, max(pos, 0), 0, min(pos + 90, self.W), 8)
+        bw, bh = self.bw, self.bh
+        if self._target is None:              # unknown length: a soft sliding block
+            blk = bw * 0.28
+            pos = (time.time() * bw * 0.9) % (bw + blk) - blk
+            x1, x2 = max(pos, 0), min(pos + blk, bw)
+        else:                                 # eased towards the real value
+            self._shown += (self._target - self._shown) * 0.25
+            if abs(self._target - self._shown) < 0.002:
+                self._shown = self._target
+            x1, x2 = 0, bw * self._shown
+        if x2 - x1 < bh:
+            self.bar.itemconfigure(self._fill, state="hidden")
         else:
-            self.bar.coords(self._fill, 0, 0, self.W * max(0.0, min(1.0, self._frac)), 8)
+            self.bar.coords(self._fill, *rr_points(x1, 0, x2, bh, bh / 2))
+            self.bar.itemconfigure(self._fill, state="normal")
 
 
 def main():
-    if sys.platform == "win32":
-        import ctypes
+    if IS_WIN:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gunmacro.loader.2")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gunmacro.loader.3")
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
