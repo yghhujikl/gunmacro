@@ -63,7 +63,7 @@ RUN_MIN, RUN_MAX, RUN_DEFAULT = 0.05, 1.0, 0.5
 TIME_H = 64
 RELOAD_H = 64
 ROW_H = 50
-MAX_CONFIGS = 6
+MAX_CONFIGS = 50
 NAME_MAX = 20
 CFG_BTN = "#2a2a2a"
 CFG_BTN_HOVER = "#3a3a3a"
@@ -71,10 +71,18 @@ DANGER = "#8f2f2f"
 DANGER_HOVER = "#a83a3a"
 ERROR_COLOR = "#e5737a"
 
+# ---------- Adjustments tab ----------
+SEQ_H = 118
+SEQ_MAX = 8                       # most guns allowed in the sequence
+SLIDER_W = 190
+TYPE_RATE_DEFAULT = 26            # number presses per second
+CLICK_RATE_DEFAULT = 32           # auto-clicks per second
+
 # ---------- Sidebar ----------
 SIDEBAR = "#0f0f0f"
 HILITE = "#262626"
-TABS = ["Gun Macro", "Extras", "Config"]
+TABS = ["Gun Macro", "Extras", "Adjustments", "Config"]
+CONFIG_TAB = TABS.index("Config")
 SB_W = 190           # sidebar width
 TAB_H = 44
 TAB_GAP = 8
@@ -113,6 +121,16 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+
+# ---------- Mouse buttons usable as the keybind ----------
+# Left click is excluded: the UI and the auto-clicker both use it.
+MOUSE_NAMES = {
+    0x02: "Right Click",
+    0x04: "Middle Click",
+    0x05: "Mouse 4",
+    0x06: "Mouse 5",
+}
+MOUSE_VKS = tuple(MOUSE_NAMES)
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -167,10 +185,16 @@ class MacroRunner:
 
     def __init__(self):
         self.running = False
+        self.last_end = 0.0                  # when the last run finished (for cooldown)
         self._stop = threading.Event()
 
-    def start(self, vks, seconds, auto_reload=False, jitter=False, mid_reload=False):
-        if self.running or not vks:
+    def start(self, seq_vks, reload_vks, seconds, auto_reload=False, jitter=False,
+              mid_reload=False, type_delay=TYPE_DELAY, click_delay=CLICK_DELAY,
+              watch_hwnd=None):
+        """seq_vks: keys pressed in order (repeats allowed).
+        reload_vks: every gun number, used by the reload pass.
+        watch_hwnd: stop the run if this window loses focus."""
+        if self.running or not seq_vks:
             return
         self.running = True
         self._stop.clear()
@@ -179,10 +203,10 @@ class MacroRunner:
         # when the reload phase begins (None = auto reload off)
         reload_at = None
         if auto_reload:
-            one_pass = len(vks) * (1 + RELOAD_TAPS) * (KEY_HOLD + RELOAD_DELAY)
+            one_pass = len(reload_vks) * (1 + RELOAD_TAPS) * (KEY_HOLD + RELOAD_DELAY)
             window = min(seconds, max(RELOAD_FRACTION * seconds, one_pass * 1.2))
             reload_at = end - window
-        self._vks = vks
+        self._vks = reload_vks
         self._end = end
         self._reload_at = reload_at
 
@@ -200,7 +224,7 @@ class MacroRunner:
             while alive():
                 if reloading():
                     # near the end: each number, then R a few times
-                    for vk in vks:
+                    for vk in reload_vks:
                         if not alive():
                             break
                         key_tap(vk)
@@ -211,9 +235,9 @@ class MacroRunner:
                             key_tap(RELOAD_VK)
                             pause(RELOAD_DELAY)
                     continue
-                key_tap(vks[i % len(vks)])
+                key_tap(seq_vks[i % len(seq_vks)])
                 i += 1
-                pause(TYPE_DELAY)
+                pause(type_delay)
 
         def clicker():
             while alive():
@@ -221,7 +245,7 @@ class MacroRunner:
                     time.sleep(0.005)
                     continue
                 mouse_click()
-                pause(CLICK_DELAY)
+                pause(click_delay)
 
         def reloader():
             # mid reload runs on its own thread so the number/click speed is untouched
@@ -232,15 +256,26 @@ class MacroRunner:
                 key_tap(RELOAD_VK)
                 pause(MID_RELOAD_DELAY)
 
+        def watcher():
+            # stop the moment another window takes focus
+            while alive():
+                if ctypes.windll.user32.GetForegroundWindow() != watch_hwnd:
+                    self.stop()
+                    return
+                time.sleep(0.01)
+
         def run():
             threads = [threading.Thread(target=typer, daemon=True),
                        threading.Thread(target=clicker, daemon=True)]
             if mid_reload:
                 threads.append(threading.Thread(target=reloader, daemon=True))
+            if watch_hwnd is not None:
+                threads.append(threading.Thread(target=watcher, daemon=True))
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
+            self.last_end = time.perf_counter()
             self.running = False
 
         threading.Thread(target=run, daemon=True).start()
@@ -585,6 +620,7 @@ class App(tk.Tk):
         self._build_time_row()
         self._build_reload_row()
         self._build_extras()
+        self._build_tuning()
         self._build_config_view()
 
         self.active_tab = 0
@@ -641,6 +677,11 @@ class App(tk.Tk):
             "panic": self.panic,
             "panic_vk": self.panic_vk,
             "panic_mods": list(self.panic_mods),
+            "stop_on_blur": self.stop_on_blur,
+            "sequence": list(self.sequence),
+            "type_rate": self.type_rate,
+            "click_rate": self.click_rate,
+            "cooldown": self.cooldown,
         }
 
     def _apply_snapshot(self, d):
@@ -682,12 +723,23 @@ class App(tk.Tk):
         if isinstance(ar, bool):
             self._set_reload(ar, animate=False)
 
-        for key in ("hold_mode", "mid_reload", "roblox_only", "jitter"):
+        for key in ("hold_mode", "mid_reload", "roblox_only", "jitter", "stop_on_blur"):
             v = d.get(key)
             if isinstance(v, bool):
                 self._set_toggle(key, v, animate=False)
         if not self.hold_mode and self.mid_reload:
             self._set_toggle("mid_reload", False, animate=False)
+
+        seq = d.get("sequence")
+        if (isinstance(seq, list) and 1 <= len(seq) <= SEQ_MAX
+                and all(isinstance(i, int) and not isinstance(i, bool)
+                        and 0 <= i < len(MODES) for i in seq)):
+            self.sequence = list(seq)
+        for key in self._sliders:
+            v = d.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                self._set_slider(key, v)
+        self._draw_sequence()
 
         pk = d.get("panic")
         if isinstance(pk, str) and pk:
@@ -912,6 +964,7 @@ class App(tk.Tk):
         self.mid_reload = False
         self.roblox_only = False
         self.jitter = False
+        self.stop_on_blur = False
         self.panic = "None"
         self.panic_vk = None
         self.panic_mods = (False, False, False)
@@ -929,6 +982,8 @@ class App(tk.Tk):
                           "Only fires when the Roblox window is in front")
         self._make_toggle("jitter", "Random Jitter",
                           "Randomizes the delays a little on every press")
+        self._make_toggle("stop_on_blur", "Stop On Focus Loss",
+                          "Cancels a run if you switch away from the window it started in")
         self._build_panic_row()
 
     def _make_toggle(self, key, title, desc):
@@ -1086,12 +1141,214 @@ class App(tk.Tk):
         self._draw_panic()
         return "break"
 
+    # ---------- Adjustments tab: sequence + speed + cooldown ----------
+    def _build_tuning(self):
+        self.tuning_view = tk.Frame(self.content, bg=BG)   # packed only on the Adjustments tab
+        self.sequence = list(range(len(MODES)))             # indexes into MODES
+        self.type_rate = TYPE_RATE_DEFAULT
+        self.click_rate = CLICK_RATE_DEFAULT
+        self.cooldown = 0.0
+        self._sliders = {}
+        self._seq_font = tkfont.Font(family="Segoe UI Semibold", size=10)
+
+        tk.Frame(self.tuning_view, bg=BG, height=14).pack()
+        self._build_sequence_row()
+        self._make_slider("type_rate", "Number Speed", "Hotbar presses per second",
+                          8, 40, 1, lambda v: f"{v:g}/s")
+        self._make_slider("click_rate", "Click Speed", "Auto-clicks per second",
+                          8, 50, 1, lambda v: f"{v:g}/s")
+        self._make_slider("cooldown", "Cooldown", "Pause after a run ends",
+                          0, 2, 0.05, lambda v: "Off" if v <= 0 else f"{v:g}s")
+
+    # --- sequence editor ---
+    def _build_sequence_row(self):
+        row = tk.Canvas(self.tuning_view, height=SEQ_H, bg=BG, highlightthickness=0)
+        row.pack(side="top", fill="x", padx=32, pady=(0, 10))
+        self.seq_row = row
+        row.bind("<Configure>", self._draw_sequence)
+
+        # clicks + hover are bound to tags once; hover only recolors (never redraws)
+        for i in range(len(MODES)):
+            self._seq_bind(f"seqadd{i}", f"seqaddbg{i}", CFG_BTN, CFG_BTN_HOVER,
+                           lambda i=i: self._seq_add(i))
+        self._seq_bind("seqreset", "seqresetbg", CFG_BTN, CFG_BTN_HOVER, self._seq_reset)
+        for pos in range(SEQ_MAX):
+            self._seq_bind(f"seqchip{pos}", f"seqchipbg{pos}", KEYBOX, DANGER,
+                           lambda pos=pos: self._seq_remove(pos))
+        self._draw_sequence()
+
+    def _seq_bind(self, tag, bg_tag, base, hover, action):
+        r = self.seq_row
+        r.tag_bind(tag, "<Button-1>", lambda e: action())
+
+        def enter(_e):
+            r.config(cursor="hand2")
+            r.itemconfig(bg_tag, fill=hover, outline=hover)
+
+        def leave(_e):
+            r.config(cursor="arrow")
+            r.itemconfig(bg_tag, fill=base, outline=base)
+
+        r.tag_bind(tag, "<Enter>", enter)
+        r.tag_bind(tag, "<Leave>", leave)
+
+    def _draw_sequence(self, e=None):
+        c = self.seq_row
+        w = e.width if e else c.winfo_width()
+        c.delete("all")
+        rounded_rect(c, 1, 1, w - 1, SEQ_H - 1, CARD_RADIUS, fill=CARD, outline=CARD)
+        c.create_text(22, 24, text="Sequence", anchor="w", fill=TEXT,
+                      font=("Segoe UI Semibold", 12))
+        c.create_text(22, 47, anchor="w", fill=SUBTEXT, font=("Segoe UI", 9),
+                      text="Order the guns fire in. Click one below to remove it")
+
+        # add / reset buttons, right-aligned on the top row
+        buttons = [(f"seqadd{i}", f"seqaddbg{i}", f"+ {MODES[i]}") for i in range(len(MODES))]
+        buttons.append(("seqreset", "seqresetbg", "Reset"))
+        x_right = w - 18
+        for tag, bg_tag, label in reversed(buttons):
+            bw = self._seq_font.measure(label) + 22
+            x1 = x_right - bw
+            rounded_rect(c, x1, 11, x_right, 37, 6, fill=CFG_BTN, outline=CFG_BTN,
+                         tags=(tag, bg_tag))
+            c.create_text((x1 + x_right) / 2, 24, text=label, fill=TEXT,
+                          font=self._seq_font, tags=tag)
+            x_right = x1 - 6
+
+        # the sequence itself
+        x = 22
+        for pos, gi in enumerate(self.sequence):
+            label = MODES[gi]
+            cw = max(46, self._seq_font.measure(label) + 24)
+            rounded_rect(c, x, 73, x + cw, 103, 7, fill=KEYBOX, outline=KEYBOX,
+                         tags=(f"seqchip{pos}", f"seqchipbg{pos}"))
+            c.create_text(x + cw / 2, 88, text=label, fill=TEXT, font=self._seq_font,
+                          tags=f"seqchip{pos}")
+            x += cw + 6
+
+    def _seq_add(self, gi):
+        if len(self.sequence) >= SEQ_MAX:
+            self._flash(f"Sequence is full (max {SEQ_MAX})", error=True)
+            return
+        self.sequence.append(gi)
+        self._draw_sequence()
+
+    def _seq_remove(self, pos):
+        if pos >= len(self.sequence):
+            return
+        if len(self.sequence) == 1:
+            self._flash("The sequence needs at least one gun", error=True)
+            return
+        self.sequence.pop(pos)
+        self._draw_sequence()
+
+    def _seq_reset(self):
+        self.sequence = list(range(len(MODES)))
+        self._draw_sequence()
+
+    # --- sliders ---
+    def _make_slider(self, key, title, desc, lo, hi, step, fmt):
+        row = tk.Canvas(self.tuning_view, height=RELOAD_H, bg=BG, highlightthickness=0)
+        row.pack(side="top", fill="x", padx=32, pady=(0, 10))
+        row.create_text(22, RELOAD_H / 2 - 10, text=title, anchor="w", fill=TEXT,
+                        font=("Segoe UI Semibold", 12))
+        row.create_text(22, RELOAD_H / 2 + 12, text=desc, anchor="w", fill=SUBTEXT,
+                        font=("Segoe UI", 9))
+        val = row.create_text(0, RELOAD_H / 2, text="", anchor="e", fill=TEXT,
+                              font=("Segoe UI Semibold", 11))
+        sc = tk.Canvas(row, width=SLIDER_W, height=28, bg=CARD, highlightthickness=0,
+                       cursor="hand2")
+        win = row.create_window(0, RELOAD_H / 2, window=sc, anchor="e")
+
+        def layout(e):
+            row.delete("card")
+            rounded_rect(row, 1, 1, e.width - 1, RELOAD_H - 1, CARD_RADIUS,
+                         fill=CARD, outline=CARD, tags="card")
+            row.tag_lower("card")
+            row.coords(win, e.width - 88, RELOAD_H / 2)
+            row.coords(val, e.width - 20, RELOAD_H / 2)
+
+        row.bind("<Configure>", layout)
+        sc.bind("<Button-1>", lambda e: self._slider_drag(key, e.x))
+        sc.bind("<B1-Motion>", lambda e: self._slider_drag(key, e.x))
+        self._sliders[key] = {"row": row, "sc": sc, "val": val, "lo": lo, "hi": hi,
+                              "step": step, "fmt": fmt}
+        self._draw_slider(key)
+
+    def _slider_drag(self, key, x):
+        st = self._sliders[key]
+        frac = min(1.0, max(0.0, (x - 10) / (SLIDER_W - 20)))
+        self._set_slider(key, st["lo"] + frac * (st["hi"] - st["lo"]))
+
+    def _set_slider(self, key, value):
+        st = self._sliders[key]
+        step = st["step"]
+        v = round(round(float(value) / step) * step, 3)
+        v = min(st["hi"], max(st["lo"], v))
+        if float(step).is_integer():
+            v = int(round(v))
+        setattr(self, key, v)
+        self._draw_slider(key)
+
+    def _draw_slider(self, key):
+        st = self._sliders[key]
+        c, v = st["sc"], getattr(self, key)
+        frac = (v - st["lo"]) / (st["hi"] - st["lo"])
+        x = 10 + frac * (SLIDER_W - 20)
+        c.delete("all")
+        c.create_line(10, 14, SLIDER_W - 10, 14, width=4, fill=KEYBOX, capstyle="round")
+        if x > 10:
+            c.create_line(10, 14, x, 14, width=4, fill=BTN, capstyle="round")
+        c.create_oval(x - 8, 6, x + 8, 22, fill=BTN, outline=BTN)
+        st["row"].itemconfig(st["val"], text=st["fmt"](v))
+
     # ---------- Config tab ----------
     def _build_config_view(self):
         self.config_view = tk.Frame(self.content, bg=BG)   # packed only on the Config tab
         self._rename_state = None
         self._rename_started = False
         self._flash_job = None
+
+        # scrollable list: a canvas holding one inner frame of rows
+        self.cfg_canvas = tk.Canvas(self.config_view, bg=BG, highlightthickness=0,
+                                    yscrollincrement=22)
+        self.cfg_canvas.pack(fill="both", expand=True)
+        self.cfg_inner = tk.Frame(self.cfg_canvas, bg=BG)
+        self._cfg_win = self.cfg_canvas.create_window(0, 0, window=self.cfg_inner,
+                                                      anchor="nw")
+        self.cfg_canvas.bind("<Configure>", self._cfg_resize)
+        self.cfg_inner.bind("<Configure>", lambda e: self._cfg_update_region())
+        self.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
+    def _cfg_resize(self, e):
+        self.cfg_canvas.itemconfigure(self._cfg_win, width=e.width)
+        self._cfg_update_region()
+
+    def _cfg_update_region(self):
+        c = self.cfg_canvas
+        h = max(self.cfg_inner.winfo_reqheight(), c.winfo_height())
+        c.configure(scrollregion=(0, 0, c.winfo_width(), h))
+        self._cfg_draw_bar()
+
+    def _cfg_draw_bar(self):
+        c = self.cfg_canvas
+        c.delete("sbar")
+        top, bot = c.yview()
+        if bot - top >= 0.999:
+            return                                   # everything fits: no bar
+        ch, w = c.winfo_height(), c.winfo_width()
+        y0 = c.canvasy(0)
+        c.create_rectangle(w - 7, y0 + top * ch + 2, w - 4, y0 + bot * ch - 2,
+                           fill="#3a3a3a", outline="#3a3a3a", tags="sbar")
+
+    def _on_wheel(self, e):
+        if getattr(self, "active_tab", None) != CONFIG_TAB:
+            return
+        c = self.cfg_canvas
+        if c.yview() == (0.0, 1.0):
+            return
+        c.yview_scroll(-2 if e.delta > 0 else 2, "units")
+        self._cfg_draw_bar()
 
     def _flash(self, text, error=False, ms=1800):
         if self._flash_job:
@@ -1101,21 +1358,21 @@ class App(tk.Tk):
 
     def _render_configs(self):
         self._rename_state = None
-        for w in self.config_view.winfo_children():
+        for w in self.cfg_inner.winfo_children():
             w.destroy()
         names = list_configs()
         if not names:
-            tk.Label(self.config_view, text="No saved configs yet. Press + to save your current setup.",
+            tk.Label(self.cfg_inner, text="No saved configs yet. Press + to save your current setup.",
                      bg=BG, fg=SUBTEXT, font=("Segoe UI", 10)
                      ).pack(anchor="w", padx=34, pady=(22, 10))
         else:
-            tk.Frame(self.config_view, bg=BG, height=18).pack()
+            tk.Frame(self.cfg_inner, bg=BG, height=18).pack()
         for name in names:
             self._make_config_row(name)
         self._make_plus_row()
 
     def _make_config_row(self, name):
-        row = tk.Canvas(self.config_view, height=ROW_H, bg=BG, highlightthickness=0)
+        row = tk.Canvas(self.cfg_inner, height=ROW_H, bg=BG, highlightthickness=0)
         row.pack(fill="x", padx=32, pady=(0, 8))
         text_id = row.create_text(20, ROW_H / 2, text=name, anchor="w", fill=TEXT,
                                   font=("Segoe UI Semibold", 11))
@@ -1172,7 +1429,7 @@ class App(tk.Tk):
         row.bind("<Configure>", layout)
 
     def _make_plus_row(self):
-        c = tk.Canvas(self.config_view, height=ROW_H, bg=BG, highlightthickness=0,
+        c = tk.Canvas(self.cfg_inner, height=ROW_H, bg=BG, highlightthickness=0,
                       cursor="hand2")
         c.pack(fill="x", padx=32, pady=(0, 8))
         state = {"hover": False}
@@ -1207,6 +1464,7 @@ class App(tk.Tk):
         if write_json(cfg_path(name), self._snapshot()):
             self._flash(f"Saved '{name}'")
             self._render_configs()
+            self.after(60, lambda: (self.cfg_canvas.yview_moveto(1.0), self._cfg_draw_bar()))
         else:
             self._flash("Couldn't save the config", error=True)
 
@@ -1328,6 +1586,7 @@ class App(tk.Tk):
                     self.runner.stop()
             panic_was = pdown
 
+            # works for keyboard keys and mouse buttons alike (both are virtual keys)
             vk = self.keybind_vk
             if vk is None:
                 was_down = False
@@ -1359,14 +1618,25 @@ class App(tk.Tk):
             return                                   # only fire when you're in the game
         if self.roblox_only and not self._fg_is_roblox(fg):
             return
-        vks = [0x30 + int(n) for n in self.gun_numbers]   # DB, Rev, Tact
+
+        if self.runner.running:
+            if not self.hold_mode:
+                self.runner.stop()                   # press again = stop early
+            return
+        if self.cooldown > 0 and time.perf_counter() - self.runner.last_end < self.cooldown:
+            return                                   # still cooling down
+
+        all_vks = [0x30 + int(n) for n in self.gun_numbers]            # DB, Rev, Tact
+        seq_vks = [0x30 + int(self.gun_numbers[i]) for i in self.sequence]
+        type_delay = max(0.004, 1.0 / self.type_rate - KEY_HOLD)
+        click_delay = max(0.002, 1.0 / self.click_rate - CLICK_HOLD)
+        watch = fg if self.stop_on_blur else None
         if self.hold_mode:
-            if not self.runner.running:
-                self.runner.start(vks, HOLD_MAX, False, self.jitter, self.mid_reload)
-        elif self.runner.running:
-            self.runner.stop()                       # press again = stop early
+            self.runner.start(seq_vks, all_vks, HOLD_MAX, False, self.jitter,
+                              self.mid_reload, type_delay, click_delay, watch)
         else:
-            self.runner.start(vks, self.run_time, self.auto_reload, self.jitter)
+            self.runner.start(seq_vks, all_vks, self.run_time, self.auto_reload,
+                              self.jitter, False, type_delay, click_delay, watch)
 
     # ---------- Mode card: DB | Rev | Tact (+ number inputs) ----------
     def _build_mode_card(self):
@@ -1506,10 +1776,12 @@ class App(tk.Tk):
     # ---------- Keybind row (Gun Macro tab) ----------
     def _build_keybind_row(self):
         self.keybind = "None"
-        self.keybind_vk = None               # Windows virtual-key code of the bind
+        self.keybind_vk = None               # Windows virtual-key code (keyboard OR mouse button)
         self.keybind_mods = (False, False, False)   # ctrl, alt, shift
         self._capturing = False
         self._keybox_hover = False
+        self._mouse_job = None
+        self._mouse_prev = {}
         self._keybox_font = tkfont.Font(family="Segoe UI Semibold", size=10)
 
         # card ("its own window") holding the label and the keybox
@@ -1583,6 +1855,7 @@ class App(tk.Tk):
         self._capturing = True
         self._draw_keybox("...")
         self.focus_force()                   # borderless windows need this to get keys
+        self._start_mouse_capture()          # also listen for mouse buttons
 
     def _show_warning(self, text, ms=1500):
         if self._warn_job:
@@ -1594,26 +1867,63 @@ class App(tk.Tk):
         self._warn_job = None
         self.keybind_row.itemconfig(self._warn, text="")
 
+    def _commit_keybind(self, name, vk, mods):
+        """Store a finished keybind (keyboard key or mouse button) and show it."""
+        parts = []
+        if mods[0]:
+            parts.append("Ctrl")
+        if mods[1]:
+            parts.append("Alt")
+        if mods[2]:
+            parts.append("Shift")
+        parts.append(name)
+        self.keybind = " + ".join(parts)
+        self.keybind_vk = vk
+        self.keybind_mods = tuple(bool(m) for m in mods)
+        self._capturing = False
+        self._draw_keybox(self.keybind)
+
     def _on_key_press(self, e):
         if not getattr(self, "_capturing", False):
             return
         if e.keysym in MODIFIER_KEYSYMS:     # wait for the real key
             return "break"
-        parts = []
-        if e.state & CTRL_MASK:
-            parts.append("Ctrl")
-        if e.state & ALT_MASK:
-            parts.append("Alt")
-        if e.state & SHIFT_MASK:
-            parts.append("Shift")
-        parts.append(key_name(e.keysym, e.keycode))
-        self.keybind = " + ".join(parts)
-        self.keybind_vk = e.keycode if IS_WIN else None
-        self.keybind_mods = (bool(e.state & CTRL_MASK), bool(e.state & ALT_MASK),
-                             bool(e.state & SHIFT_MASK))
-        self._capturing = False
-        self._draw_keybox(self.keybind)
+        mods = (bool(e.state & CTRL_MASK), bool(e.state & ALT_MASK),
+                bool(e.state & SHIFT_MASK))
+        self._commit_keybind(key_name(e.keysym, e.keycode),
+                             e.keycode if IS_WIN else None, mods)
         return "break"
+
+    # ---------- Mouse button capture ----------
+    # Tk can't see Mouse 4/5 on Windows, so while the box says "..." we watch the
+    # buttons directly. A press only counts when the pointer is over this window.
+    def _start_mouse_capture(self):
+        if not IS_WIN:
+            return
+        self._mouse_prev = {vk: key_is_down(vk) for vk in MOUSE_VKS}   # ignore buttons already held
+        if self._mouse_job:
+            self.after_cancel(self._mouse_job)
+        self._poll_mouse_capture()
+
+    def _pointer_in_window(self):
+        x, y = self.winfo_pointerx(), self.winfo_pointery()
+        left, top = self.winfo_rootx(), self.winfo_rooty()
+        return (left <= x < left + self.winfo_width()
+                and top <= y < top + self.winfo_height())
+
+    def _poll_mouse_capture(self):
+        self._mouse_job = None
+        if not self._capturing:
+            return                                   # finished or cancelled
+        inside = self._pointer_in_window()
+        for vk in MOUSE_VKS:
+            down = key_is_down(vk)
+            if down and not self._mouse_prev.get(vk) and inside:
+                mods = (key_is_down(0x11), key_is_down(0x12), key_is_down(0x10))
+                self._commit_keybind(MOUSE_NAMES[vk], vk, mods)
+                return
+            self._mouse_prev[vk] = down
+        self._mouse_job = self.after(8, self._poll_mouse_capture)
 
     def _place_credits(self, e):
         self.sidebar.coords(self._credit1, SB_W / 2, e.height - 44)
@@ -1680,7 +1990,8 @@ class App(tk.Tk):
         self.active_tab = idx
         self.page_title.config(text=TABS[idx])
         for w in (self.mode_card, self.keybind_row, self.time_row,
-                  self.reload_row, self.extras_view, self.config_view):
+                  self.reload_row, self.extras_view, self.tuning_view,
+                  self.config_view):
             w.pack_forget()
         self._cancel_rename()
         if self._num_active is not None:
@@ -1701,9 +2012,12 @@ class App(tk.Tk):
             self.reload_row.pack(side="bottom", fill="x", padx=32, pady=(0, 10))
         elif idx == 1:
             self.extras_view.pack(side="top", fill="both", expand=True)
+        elif idx == 2:
+            self.tuning_view.pack(side="top", fill="both", expand=True)
         else:
             self._render_configs()
             self.config_view.pack(side="top", fill="both", expand=True)
+            self.cfg_canvas.yview_moveto(0)
 
         if self._hl_job:
             self.after_cancel(self._hl_job)
