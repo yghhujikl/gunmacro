@@ -344,7 +344,7 @@ class LoaderUI(tk.Tk):
         self.f_mid = tkfont.Font(family="Segoe UI Semibold", size=16)
         self.f_small = tkfont.Font(family="Segoe UI Semibold", size=13)
         self.f_btn = tkfont.Font(family="Segoe UI Semibold", size=11)
-        self.f_brand = tkfont.Font(family="Segoe UI Semibold", size=15)
+        self.f_brand = tkfont.Font(family="Segoe UI Semibold", size=32)
 
         try:
             self.attributes("-alpha", 0.0)        # fades in once it is ready
@@ -433,10 +433,8 @@ class LoaderUI(tk.Tk):
 
         self._bar_button(bar, "✕", self._fade_close, CLOSE_HOVER)
         self._bar_button(bar, "—", self._minimize, BAR_HOVER)
-        self.top_right = SpacedLabel(bar, "LOADER", self.f_mono, SUBTEXT, BAR, s(2), s(self.BAR_H))
-        self.top_right.pack(side="right", padx=(0, s(8)))
 
-        for w in (bar, left, self.top_right):
+        for w in (bar, left):
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
 
@@ -471,12 +469,9 @@ class LoaderUI(tk.Tk):
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
 
-        # wordmark tile (where the app icon used to be)
-        tw, th = s(176), s(46)
-        tile = tk.Canvas(body, width=tw, height=th, bg=BG, highlightthickness=0)
-        tile.place(relx=0.5, y=s(24), anchor="n")
-        rounded_rect(tile, 1, 1, tw - 1, th - 1, s(13), fill=TILE, outline=TILE_LINE)
-        tile.create_text(tw / 2, th / 2, text="Gun Macro", fill=TEXT, font=self.f_brand)
+        # big wordmark (no background)
+        tk.Label(body, text="Gun Macro", bg=BG, fg=TEXT, font=self.f_brand).place(
+            relx=0.5, y=s(48), anchor="center")
 
         self.title_lbl = tk.Label(body, text="Checking for updates", bg=BG, fg=TEXT,
                                   font=self.f_big)
@@ -502,17 +497,9 @@ class LoaderUI(tk.Tk):
         self.btn_cv.bind("<Button-1>", lambda e: self._on_button())
         self._show_progress()
 
-        # footer: status dot + label on the left, state on the right
-        fy = s(262)
-        dot_d = s(7)
-        self.dot = tk.Canvas(body, width=dot_d, height=dot_d, bg=BG, highlightthickness=0)
-        self._dot_item = self.dot.create_oval(0, 0, dot_d - 1, dot_d - 1,
-                                              fill=TONES["idle"], outline=TONES["idle"])
-        self.dot.place(x=s(34), y=fy + s(5))
-        foot_l = SpacedLabel(body, "WINDOWS CLIENT", self.f_mono, "#5c5c5c", BG, s(1.5), s(16))
-        foot_l.place(x=s(48), y=fy)
-        self.tag_lbl = SpacedLabel(body, "CHECKING", self.f_mono, TONES["idle"], BG, s(1.5), s(16))
-        self.tag_lbl.place(relx=1, x=-s(34), y=fy, anchor="ne")
+        # footer
+        foot = SpacedLabel(body, "API CLIENT CONNECTED", self.f_mono, "#5c5c5c", BG, s(1.5), s(16))
+        foot.place(x=s(30), y=s(262))
 
     # ----- button / progress area -----
     def _show_progress(self):
@@ -592,11 +579,6 @@ class LoaderUI(tk.Tk):
 
         step()
 
-    def _set_tag(self, text, tone):
-        col = TONES[tone]
-        self.tag_lbl.set_text(text, col)
-        self.dot.itemconfigure(self._dot_item, fill=col, outline=col)
-
     # ----- thread-safe API used by the worker -----
     def status(self, title, detail="", tag="", tone="idle"):
         self._q.put(("show", "busy", title, detail, tag, tone, ""))
@@ -639,12 +621,10 @@ class LoaderUI(tk.Tk):
                 item = self._q.get_nowait()
                 kind = item[0]
                 if kind == "show":
-                    _, mode, title, detail, tag, tone, button = item
+                    _, mode, title, detail, _tag, _tone, button = item
                     self._mode = mode
                     self._set_text(title, detail, ERROR if mode == "fail" else TEXT,
                                    SUBTEXT if mode == "fail" else LAV)
-                    if tag:
-                        self._set_tag(tag, tone)
                     if mode == "busy":
                         self._show_progress()
                     elif mode == "ask":
@@ -654,8 +634,6 @@ class LoaderUI(tk.Tk):
                         self._show_button("Close", False)
                 elif kind == "detail":
                     self.detail_lbl.config(text=clip(item[1]))
-                elif kind == "version":
-                    self.top_right.set_text(f"LOADER  {item[1].upper()}")
                 elif kind == "progress":
                     if item[1] is None:
                         self._target = None
